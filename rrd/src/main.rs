@@ -28,6 +28,7 @@ async fn main() -> anyhow::Result<()> {
         router_id = %daemon_cfg.router_id.0,
         prefix    = %format!("{}/{}", daemon_cfg.prefix.addr, daemon_cfg.prefix.len),
         ifaces    = ?daemon_cfg.ifaces,
+        fib_install = !daemon_cfg.no_fib,
         "rrd starting",
     );
 

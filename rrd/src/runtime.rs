@@ -13,6 +13,7 @@
 //!   the receiver before `run` consumes `self`.
 
 use crate::config::DaemonConfig;
+use crate::fib::{FibReconciler, RouteIntent};
 use crate::transport::{Inbound, Transport};
 use crate::wire;
 use ring_core::{Engine, Mono, NeighborId, Prefix, RouterId};
@@ -56,6 +57,8 @@ pub struct Daemon<T: Transport> {
     prefix_to_rid: HashMap<Prefix, RouterId>,
     next_nid: u32,
     rib_tx: watch::Sender<RibSnapshot>,
+    /// FIB reconciler; None when `--no-fib` is set or netlink connect failed.
+    fib: Option<FibReconciler>,
 }
 
 impl<T: Transport> Daemon<T> {
@@ -86,6 +89,7 @@ impl<T: Transport> Daemon<T> {
             prefix_to_rid,
             next_nid: 0,
             rib_tx,
+            fib: None,
         };
         (daemon, rib_rx)
     }
@@ -170,6 +174,36 @@ impl<T: Transport> Daemon<T> {
         }
     }
 
+    /// Build the list of FIB route intents from the engine's desired routes.
+    ///
+    /// For each routable `DesiredRoute`, resolve the dominant next-hop
+    /// `NeighborId` to its `(oif, fe80::)` locator via `addr_by_neighbor`.
+    /// Entries whose nexthop is unknown are silently skipped.
+    fn build_route_intents(&self) -> Vec<RouteIntent> {
+        let now = self.now();
+        let mut intents = Vec::new();
+        for dr in self.engine.desired_routes(now) {
+            if !dr.routable {
+                continue;
+            }
+            // Take the dominant (first) nexthop.
+            let nid = match dr.nexthops.first() {
+                Some(hop) => hop.via,
+                None => continue,
+            };
+            let (oif, gateway) = match self.addr_by_neighbor.get(&nid) {
+                Some(&loc) => loc,
+                None => continue,
+            };
+            intents.push(RouteIntent {
+                prefix: dr.prefix,
+                gateway,
+                oif,
+            });
+        }
+        intents
+    }
+
     /// Build a RIB snapshot from the engine's current desired_routes.
     fn build_snapshot(&self) -> RibSnapshot {
         let now = self.now();
@@ -190,6 +224,21 @@ impl<T: Transport> Daemon<T> {
 
     /// Run the daemon until `shutdown` resolves.
     pub async fn run(mut self, mut shutdown: impl Future<Output = ()> + Unpin) {
+        // Connect to the kernel FIB unless --no-fib is set.
+        if !self.cfg.no_fib {
+            match FibReconciler::connect().await {
+                Ok(fib) => {
+                    tracing::info!("fib: kernel FIB install ON (proto 155/ring)");
+                    self.fib = Some(fib);
+                }
+                Err(e) => {
+                    tracing::warn!("fib: failed to open netlink ({}); running control-plane only", e);
+                }
+            }
+        } else {
+            tracing::info!("fib: kernel FIB install disabled (--no-fib)");
+        }
+
         let tick_dur = self.cfg.cfg.tick;
         let mut interval = time::interval(tick_dur);
         // Avoid tick bursting after a long sleep.
@@ -205,6 +254,13 @@ impl<T: Transport> Daemon<T> {
                     self.sweep_stale();
                     let snap = self.build_snapshot();
                     let _ = self.rib_tx.send(snap);
+                    // FIB reconcile after each tick.
+                    if self.fib.is_some() {
+                        let intents = self.build_route_intents();
+                        if let Some(fib) = &mut self.fib {
+                            fib.reconcile(&intents).await;
+                        }
+                    }
                 }
                 result = self.transport.recv() => {
                     match result {
@@ -220,6 +276,11 @@ impl<T: Transport> Daemon<T> {
                     break;
                 }
             }
+        }
+
+        // Graceful shutdown: withdraw all installed routes.
+        if let Some(mut fib) = self.fib.take() {
+            fib.withdraw_all().await;
         }
     }
 }
@@ -244,6 +305,7 @@ mod tests {
             ifaces: vec![],
             cfg,
             policy: ForwardingPolicy::default(),
+            no_fib: true, // tests run without kernel netlink
         }
     }
 

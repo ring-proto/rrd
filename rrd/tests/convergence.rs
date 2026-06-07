@@ -23,6 +23,7 @@ fn make_config(id: &str, prefix_addr: Ipv6Addr, tick_ms: u64) -> DaemonConfig {
         ifaces: vec![],
         cfg,
         policy: ForwardingPolicy::default(),
+        no_fib: true, // in-process tests run without kernel netlink
     }
 }
 

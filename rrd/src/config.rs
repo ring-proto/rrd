@@ -75,6 +75,10 @@ pub struct Cli {
     /// Vitality action threshold phi. Overrides the default.
     #[arg(long)]
     pub phi: Option<f64>,
+
+    /// Disable kernel FIB installation (control-plane only).
+    #[arg(long, default_value_t = false)]
+    pub no_fib: bool,
 }
 
 /// Fully resolved daemon configuration, ready for use by the runtime.
@@ -86,6 +90,8 @@ pub struct DaemonConfig {
     pub ifaces: Vec<u32>,
     pub cfg: Config,
     pub policy: ForwardingPolicy,
+    /// When true, skip kernel FIB installation (control-plane only).
+    pub no_fib: bool,
 }
 
 impl DaemonConfig {
@@ -112,7 +118,7 @@ impl DaemonConfig {
             cfg.phi = p;
         }
 
-        Ok(DaemonConfig { router_id, prefix, ifaces, cfg, policy: ForwardingPolicy::default() })
+        Ok(DaemonConfig { router_id, prefix, ifaces, cfg, policy: ForwardingPolicy::default(), no_fib: cli.no_fib })
     }
 }
 
@@ -184,6 +190,7 @@ mod tests {
             kappa: Some(0.2),
             alpha: None,
             phi: None,
+            no_fib: false,
         };
         let dc = DaemonConfig::from_cli(&cli).expect("should build");
         assert_eq!(dc.router_id.0, "mynode");
