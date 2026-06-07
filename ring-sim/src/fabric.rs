@@ -1,8 +1,8 @@
 //! The simulated fabric: `ring-core` engines wired by links, driven by the event queue.
 
-use crate::event::EventQueue;
+use crate::event::{Event, EventQueue};
 use crate::rng::Rng;
-use ring_core::{Config, Engine, ForwardingPolicy, NeighborId, Prefix, RouterId};
+use ring_core::{Config, Engine, ForwardingPolicy, NeighborId, Prefix, Route, RouterId};
 use std::net::Ipv6Addr;
 use std::time::Duration;
 
@@ -173,6 +173,100 @@ impl Fabric {
     }
 }
 
+impl Fabric {
+    fn local(&self, node: usize) -> Duration {
+        self.time + self.nodes[node].clock_offset
+    }
+
+    fn do_emit(&mut self, node: usize) {
+        // always reschedule this node's next emit (a down node keeps its slot, resumes on revive)
+        let next = self.time + self.cfg.tick;
+        self.queue.push(next, Event::Emit { node });
+        if !self.nodes[node].up {
+            return;
+        }
+        let local = self.local(node);
+        let emit = self.nodes[node].engine.step(local).emit;
+        // gather candidate deliveries first (no rng), then apply loss + schedule (rng + queue)
+        let mut cands: Vec<(usize, Duration, f64)> = Vec::new();
+        for a in &self.adj[node] {
+            let link = &self.links[a.link];
+            if link.up && self.nodes[a.other].up {
+                cands.push((a.other, self.time + link.delay, link.loss));
+            }
+        }
+        for (to, at, loss) in cands {
+            if self.rng.chance(loss) {
+                continue; // dropped in flight
+            }
+            self.queue.push(at, Event::Deliver { to, from: NeighborId(node as u32), msg: emit.clone() });
+        }
+    }
+
+    fn do_deliver(&mut self, to: usize, from: NeighborId, msg: ring_core::Message) {
+        if !self.nodes[to].up {
+            return; // a powered-off node receives nothing
+        }
+        let local = self.local(to);
+        self.nodes[to].engine.ingest(local, from, &msg);
+    }
+
+    /// Advance the simulation, processing every event up to and including `end`.
+    pub fn run_until(&mut self, end: Duration) {
+        while let Some(t) = self.queue.peek_time() {
+            if t > end {
+                break;
+            }
+            let s = self.queue.pop().unwrap();
+            self.time = s.time;
+            match s.event {
+                Event::Emit { node } => self.do_emit(node),
+                Event::Deliver { to, from, msg } => self.do_deliver(to, from, msg),
+            }
+        }
+        self.time = end;
+    }
+
+    /// Advance by `ticks` of wall-cadence from the current time. (Note: `run_ticks(0)` is not a
+    /// strict no-op — it still processes any events already due at the current time.)
+    pub fn run_ticks(&mut self, ticks: u64) {
+        let span = Duration::from_nanos(ticks.saturating_mul(self.cfg.tick.as_nanos() as u64));
+        self.run_until(self.time + span);
+    }
+
+    // --- fault injection (applied immediately at the current sim time) ---
+    pub fn kill_node(&mut self, node: usize) {
+        self.nodes[node].up = false;
+    }
+    pub fn revive_node(&mut self, node: usize) {
+        self.nodes[node].up = true;
+    }
+    pub fn cut_link(&mut self, link: usize) {
+        self.links[link].up = false;
+    }
+    pub fn relink(&mut self, link: usize) {
+        self.links[link].up = true;
+    }
+    /// Find the link index joining `a` and `b` (either orientation), if any.
+    pub fn link_between(&self, a: usize, b: usize) -> Option<usize> {
+        self.links
+            .iter()
+            .position(|l| (l.a == a && l.b == b) || (l.a == b && l.b == a))
+    }
+
+    /// The current routing read at node `from` toward node `dst` (vitality aged to sim-now).
+    pub fn route(&self, from: usize, dst: usize) -> Option<Route> {
+        let id = self.nodes[dst].id.clone();
+        self.nodes[from].engine.route(self.local(from), &id)
+    }
+    pub fn is_routable(&self, from: usize, dst: usize) -> bool {
+        self.route(from, dst).map(|r| r.routable).unwrap_or(false)
+    }
+    pub fn set_stress(&mut self, node: usize, s: f64) {
+        self.nodes[node].engine.set_stress(s);
+    }
+}
+
 /// Multiply a Duration by a non-negative f64 factor (ticks of delay).
 fn mul_dur(d: Duration, factor: f64) -> Duration {
     Duration::from_nanos((d.as_nanos() as f64 * factor) as u64)
@@ -220,5 +314,28 @@ mod tests {
             assert!(ns.clock_offset > Duration::ZERO);
         }
         assert_ne!(fab.nodes[0].clock_offset, fab.nodes[1].clock_offset);
+    }
+
+    #[test]
+    fn two_node_async_fabric_becomes_routable() {
+        let cfg = Config::default();
+        let mut fab = Fabric::line(2, cfg, 7);
+        assert!(!fab.is_routable(0, 1), "not routable before any rounds");
+        fab.run_ticks(40);
+        assert!(fab.is_routable(0, 1), "0→1 routable after convergence");
+        assert!(fab.is_routable(1, 0), "1→0 routable after convergence");
+        let r = fab.route(0, 1).unwrap();
+        assert_eq!(r.via, Some(ring_core::NeighborId(1)));
+    }
+
+    #[test]
+    fn killing_the_only_neighbour_severs_within_bounds() {
+        let cfg = Config::default();
+        let mut fab = Fabric::line(2, cfg, 7);
+        fab.run_ticks(40);
+        assert!(fab.is_routable(0, 1));
+        fab.kill_node(1); // node 1 dies; stops asserting its self-pin
+        fab.run_ticks(400);
+        assert!(!fab.is_routable(0, 1), "0 severs the dead destination 1");
     }
 }
