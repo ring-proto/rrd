@@ -1,25 +1,35 @@
 #!/usr/bin/env bash
-# harness/lab.sh — netns line-topology lab for rrd.
+# harness/lab.sh — ROOTLESS netns line-topology lab for rrd (no sudo).
 #
 # Builds a line of N network namespaces ring0—ring1—…—ring(N-1) connected by
 # veth pairs, each node owning a ULA prefix fd00:a<i>::/64 (host address
 # ::1 on a dummy interface dum0), with IPv6 forwarding enabled and an rrd
 # daemon launched in each namespace participating on its veth link(s).
 #
-# This file is meant to be *sourced* by demo.sh, but can also be run directly:
-#   sudo bash harness/lab.sh up 3     # build a 3-node line
-#   sudo bash harness/lab.sh down     # tear everything down
-#   sudo bash harness/lab.sh routes 0 # show proto-ring routes in ring0
+# ── Rootless design (PID-based namespaces inside ONE user namespace) ──────────
+# Unlike the old sudo/`ip netns add` version, this lab runs entirely inside a
+# single unprivileged user namespace.  `ip netns add` does NOT work rootless
+# (/run/netns is root-owned), so instead each node's network namespace is held
+# open by a placeholder `unshare -n sleep infinity` child; we record its PID and
+# address the namespace by PID via `nsenter -t <PID> -n …`.  The parent shell
+# (which must already be the root of a user+net namespace — see demo.sh's
+# `unshare -rmn` re-exec) holds CAP_NET_ADMIN over every namespace it creates,
+# so it can make veth pairs, move ends into children by PID, set sysctls, and
+# the rrd daemon's rtnetlink + multicast all work without real root.
 #
-# All privileged operations use the caller's privileges (run under sudo).
-# lab_down is idempotent and is also invoked from the demo's exit trap so
-# namespaces never leak.
+# This file is meant to be *sourced* by demo.sh from INSIDE the user namespace,
+# but can also be run directly (it will re-exec itself into `unshare -rmn`):
+#   bash harness/lab.sh up 3     # build a 3-node line, then drop to a shell? no:
+#                                # direct `up` builds + sleeps so you can poke it
+#   bash harness/lab.sh routes 0 # (only meaningful inside the same userns)
+#
+# lab_down is idempotent and is also invoked from the demo's exit trap so no
+# placeholder/daemon processes leak.  There is no `ip netns del` — killing a
+# node's placeholder PID makes its (anonymous) netns vanish automatically.
 
 set -u
 
 # ── Paths ────────────────────────────────────────────────────────────────────
-# Resolve the repo root from this script's location so it works under sudo and
-# regardless of the caller's CWD.
 LAB_SH_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${LAB_SH_DIR}/.." && pwd)"
 RRD_BIN="${RRD_BIN:-${REPO_ROOT}/target/release/rrd}"
@@ -28,38 +38,64 @@ LOG_DIR="${LOG_DIR:-/tmp/rrd_lab}"
 # Tick interval for the daemons (ms).
 TICK_MS="${TICK_MS:-50}"
 
-# Veth naming: link between node i and node i+1.
-#   end in ring$i      : veth${i}a   (the "a" side, lives in the lower-index ns)
-#   end in ring$(i+1)  : veth${i}b   (the "b" side, lives in the higher-index ns)
-veth_a() { echo "veth${1}a"; }   # arg: link index i (in ring$i)
-veth_b() { echo "veth${1}b"; }   # arg: link index i (in ring$((i+1)))
+# ── State (populated by lab_up) ──────────────────────────────────────────────
+# NODE_PID[i]  : PID of the placeholder holding ring$i's netns.
+# RRD_PID[i]   : PID of the rrd daemon running in ring$i.
+# LAB_N        : node count of the current lab.
+declare -a NODE_PID=()
+declare -a RRD_PID=()
+LAB_N=0
 
-ns() { echo "ring${1}"; }        # arg: node index
+# Veth naming: link between node i and node i+1.
+#   end in ring$i      : veth${i}a   (the "a" side, lives in the lower-index node)
+#   end in ring$(i+1)  : veth${i}b   (the "b" side, lives in the higher-index node)
+veth_a() { echo "veth${1}a"; }   # arg: link index i (lives in ring$i)
+veth_b() { echo "veth${1}b"; }   # arg: link index i (lives in ring$((i+1)))
+
+ns() { echo "ring${1}"; }        # arg: node index (label only; we address by PID)
+
+# nsx <node-index> <cmd...> : run a command inside node i's netns by PID.
+nsx() {
+    local i="$1"; shift
+    nsenter -t "${NODE_PID[$i]}" -n "$@"
+}
 
 # ── lab_down ─────────────────────────────────────────────────────────────────
-# Delete every ring* netns (which also destroys any veth/dummy inside them) and
-# kill any stray rrd daemons. Ignores all errors so it is safe to call any time.
+# Kill every rrd daemon and every placeholder PID from the current lab, then
+# REAP them with `wait`.  Killing a placeholder reaps its (anonymous) netns and
+# every interface in it; a veth's peer is auto-removed when either end
+# disappears.  Idempotent / error-tolerant.
+#
+# Reaping matters: if this shell exits while it still has live/zombie children
+# (the `sleep infinity` placeholders or the backgrounded daemons), the
+# surrounding sandbox treats the namespace job as having leaked processes and
+# SIGTERMs the whole group.  We therefore SIGKILL and then `wait` every child so
+# the shell exits clean, leaving nothing behind.
 lab_down() {
-    # Kill daemons first so they release their netns sockets.
-    pkill -f "${RRD_BIN}" 2>/dev/null || true
-
-    # Delete all ring* namespaces; deleting a netns reaps the interfaces in it,
-    # and a veth's peer is auto-removed when either end disappears.
-    local n
-    for n in $(ip netns list 2>/dev/null | awk '{print $1}' | grep -E '^ring[0-9]+$' || true); do
-        ip netns del "$n" 2>/dev/null || true
+    local p
+    # Daemons first so they release their netns sockets, then the placeholders.
+    for p in "${RRD_PID[@]:-}"; do
+        [ -n "$p" ] && kill -KILL "$p" 2>/dev/null || true
     done
-
-    # Belt-and-braces: remove any leftover veth in the host namespace.
-    local l
-    for l in $(ip -o link show 2>/dev/null | awk -F': ' '{print $2}' | sed 's/@.*//' | grep -E '^veth[0-9]+[ab]$' || true); do
-        ip link del "$l" 2>/dev/null || true
+    for p in "${NODE_PID[@]:-}"; do
+        [ -n "$p" ] && kill -KILL "$p" 2>/dev/null || true
     done
+    # Belt-and-braces: reap any stray rrd in THIS user namespace (e.g. from a
+    # crashed prior run); pkill only reaches processes we can signal.
+    pkill -KILL -f "${RRD_BIN}" 2>/dev/null || true
+    # Reap every child we just killed so no zombie/orphan survives this shell.
+    for p in "${RRD_PID[@]:-}" "${NODE_PID[@]:-}"; do
+        [ -n "$p" ] && wait "$p" 2>/dev/null || true
+    done
+    NODE_PID=()
+    RRD_PID=()
+    LAB_N=0
     return 0
 }
 
 # ── lab_up <N> ───────────────────────────────────────────────────────────────
-# Build a line of N nodes and launch a daemon in each.
+# Build a line of N nodes and launch a daemon in each.  MUST be called from
+# inside the lab's user+net namespace (the `unshare -rmn` shell).
 lab_up() {
     local N="${1:?lab_up requires a node count}"
     if [ "$N" -lt 2 ]; then
@@ -71,54 +107,70 @@ lab_up() {
         return 1
     fi
 
-    mkdir -p "$LOG_DIR"
+    # Ensure a log directory we can actually write to.  A previous *sudo* run of
+    # the old lab may have left root-owned logs in the default /tmp/rrd_lab; in
+    # this unprivileged user namespace we map to the invoking uid and cannot
+    # overwrite root-owned files (and /tmp is sticky, so we cannot unlink them
+    # either).  Detect that and fall back to a uid-scoped directory so the
+    # rootless demo never trips over a stale privileged run.
+    mkdir -p "$LOG_DIR" 2>/dev/null || true
+    if ! { : >"${LOG_DIR}/.wtest" ; } 2>/dev/null; then
+        LOG_DIR="${LOG_DIR}.$(id -u)"
+        mkdir -p "$LOG_DIR"
+    fi
+    rm -f "${LOG_DIR}/.wtest" 2>/dev/null || true
+    # Clear any stale per-node logs we own from a prior rootless run.
+    rm -f "${LOG_DIR}"/n*.log 2>/dev/null || true
+    LAB_N="$N"
 
     local i
-    # 1) Create namespaces, bring up lo, enable forwarding + a dummy prefix.
+    # 0) Spawn a placeholder per node to hold an anonymous netns open by PID.
     for ((i = 0; i < N; i++)); do
-        local nsi; nsi="$(ns "$i")"
-        ip netns add "$nsi"
-        ip netns exec "$nsi" ip link set lo up
-        ip netns exec "$nsi" sysctl -qw net.ipv6.conf.all.forwarding=1
-        ip netns exec "$nsi" sysctl -qw net.ipv6.conf.default.forwarding=1
-        # Disable DAD on the dummy so its prefix host address is usable at once.
-        ip netns exec "$nsi" sysctl -qw net.ipv6.conf.dum0.accept_dad=0 2>/dev/null || true
+        unshare -n sleep infinity &
+        NODE_PID[$i]=$!
+    done
+    # Give the placeholders a moment to enter their new netns.
+    sleep 0.3
+
+    # 1) Per-node base setup: lo up, forwarding on, dummy prefix host address.
+    for ((i = 0; i < N; i++)); do
+        nsx "$i" ip link set lo up
+        nsx "$i" sysctl -qw net.ipv6.conf.all.forwarding=1
+        nsx "$i" sysctl -qw net.ipv6.conf.default.forwarding=1
         # Dummy interface carrying this node's prefix host address.
-        ip netns exec "$nsi" ip link add dum0 type dummy
-        ip netns exec "$nsi" sysctl -qw net.ipv6.conf.dum0.accept_dad=0
-        ip netns exec "$nsi" ip -6 addr add "fd00:a${i}::1/64" dev dum0
-        ip netns exec "$nsi" ip link set dum0 up
+        nsx "$i" ip link add dum0 type dummy
+        # Disable DAD so the prefix host address is usable immediately.
+        nsx "$i" sysctl -qw net.ipv6.conf.dum0.accept_dad=0
+        nsx "$i" ip -6 addr add "fd00:a${i}::1/64" dev dum0
+        nsx "$i" ip link set dum0 up
     done
 
-    # 2) Create veth links between adjacent nodes.
+    # 2) Create veth links between adjacent nodes and move ends into place.
+    #    The pair is created in the PARENT netns (the unshare -rmn shell, which
+    #    has CAP_NET_ADMIN), then each end is pushed into a child by PID.
     for ((i = 0; i < N - 1; i++)); do
         local a; a="$(veth_a "$i")"
         local b; b="$(veth_b "$i")"
-        local nsa; nsa="$(ns "$i")"
-        local nsb; nsb="$(ns "$((i + 1))")"
 
-        # Create the pair in the host ns, then move each end into its namespace.
         ip link add "$a" type veth peer name "$b"
-        ip link set "$a" netns "$nsa"
-        ip link set "$b" netns "$nsb"
+        ip link set "$a" netns "${NODE_PID[$i]}"
+        ip link set "$b" netns "${NODE_PID[$((i + 1))]}"
 
-        # Bring both ends up. Disable DAD so fe80:: is usable immediately
-        # (DAD would otherwise hold the link-local in "tentative" for ~1s).
-        for pair in "$nsa $a" "$nsb $b"; do
-            set -- $pair
-            local pns="$1"; local pif="$2"
-            ip netns exec "$pns" sysctl -qw "net.ipv6.conf.${pif}.accept_dad=0"
-            ip netns exec "$pns" ip link set "$pif" up
-        done
+        # Disable DAD on each end BEFORE bringing it up, so fe80:: is usable at
+        # once (DAD would otherwise hold the link-local "tentative" for ~1s and
+        # break neighbour resolution / multicast for the daemon).
+        nsx "$i"          sysctl -qw "net.ipv6.conf.${a}.accept_dad=0"
+        nsx "$((i + 1))"  sysctl -qw "net.ipv6.conf.${b}.accept_dad=0"
+        nsx "$i"          ip link set "$a" up
+        nsx "$((i + 1))"  ip link set "$b" up
     done
 
-    # 3) Wait for every veth link-local (fe80::) to leave the tentative state so
-    #    the daemon's multicast and the kernel's neigh resolution work at once.
+    # 3) Wait for every veth link-local (fe80::) to be present and non-tentative.
     lab_wait_lladdr "$N"
 
-    # 4) Launch a daemon in each namespace on its veth interface(s).
+    # 4) Launch a daemon in each namespace on its veth interface(s).  No sudo:
+    #    we are root-in-userns with CAP_NET_ADMIN, so rtnetlink + multicast work.
     for ((i = 0; i < N; i++)); do
-        local nsi; nsi="$(ns "$i")"
         local -a ifargs=()
         # Link to the previous node lives on this node's "b" end (veth(i-1)b).
         if [ "$i" -gt 0 ]; then
@@ -130,12 +182,13 @@ lab_up() {
         fi
 
         RUST_LOG="${RUST_LOG:-info}" \
-        ip netns exec "$nsi" "$RRD_BIN" \
+        nsenter -t "${NODE_PID[$i]}" -n "$RRD_BIN" \
             --router-id "n${i}" \
             --prefix "fd00:a${i}::/64" \
             "${ifargs[@]}" \
             --tick-ms "$TICK_MS" \
             >"${LOG_DIR}/n${i}.log" 2>&1 &
+        RRD_PID[$i]=$!
     done
 
     return 0
@@ -150,13 +203,12 @@ lab_wait_lladdr() {
         local pending=0 i
         for ((i = 0; i < N - 1; i++)); do
             local a; a="$(veth_a "$i")"; local b; b="$(veth_b "$i")"
-            local nsa; nsa="$(ns "$i")"; local nsb; nsb="$(ns "$((i + 1))")"
             # An address still doing DAD is reported with the "tentative" flag.
-            if ip netns exec "$nsa" ip -6 addr show dev "$a" scope link 2>/dev/null | grep -q 'tentative'; then pending=1; fi
-            if ip netns exec "$nsb" ip -6 addr show dev "$b" scope link 2>/dev/null | grep -q 'tentative'; then pending=1; fi
+            if nsx "$i"         ip -6 addr show dev "$a" scope link 2>/dev/null | grep -q 'tentative'; then pending=1; fi
+            if nsx "$((i + 1))" ip -6 addr show dev "$b" scope link 2>/dev/null | grep -q 'tentative'; then pending=1; fi
             # Also require the link-local to actually exist yet.
-            if ! ip netns exec "$nsa" ip -6 addr show dev "$a" scope link 2>/dev/null | grep -q 'fe80'; then pending=1; fi
-            if ! ip netns exec "$nsb" ip -6 addr show dev "$b" scope link 2>/dev/null | grep -q 'fe80'; then pending=1; fi
+            if ! nsx "$i"         ip -6 addr show dev "$a" scope link 2>/dev/null | grep -q 'fe80'; then pending=1; fi
+            if ! nsx "$((i + 1))" ip -6 addr show dev "$b" scope link 2>/dev/null | grep -q 'fe80'; then pending=1; fi
         done
         [ "$pending" -eq 0 ] && return 0
         sleep 0.1
@@ -170,33 +222,39 @@ lab_wait_lladdr() {
 # Show this node's proto-ring routes.
 lab_route_table() {
     local i="${1:?node index required}"
-    ip netns exec "$(ns "$i")" ip -6 route show proto ring
+    nsx "$i" ip -6 route show proto ring
 }
 
 # ── lab_link_set <i> <j> <up|down> ───────────────────────────────────────────
-# Bring the link between node i and node j up or down, from node i's side.
-# (i and j must be adjacent.)
+# Bring the link between adjacent nodes i and j up or down (both ends).
 lab_link_set() {
     local i="$1"; local j="$2"; local state="$3"
     local lo hi
     if [ "$i" -lt "$j" ]; then lo="$i"; hi="$j"; else lo="$j"; hi="$i"; fi
     # The link index is the lower node; its "a" end lives in ring$lo, "b" in ring$hi.
-    # Operate on the "b" end (ring$hi side) to sever it locally.
-    ip netns exec "$(ns "$hi")" ip link set "$(veth_b "$lo")" "$state"
-    # Mirror on the "a" end so both directions go down/up cleanly.
-    ip netns exec "$(ns "$lo")" ip link set "$(veth_a "$lo")" "$state"
+    nsx "$hi" ip link set "$(veth_b "$lo")" "$state"
+    nsx "$lo" ip link set "$(veth_a "$lo")" "$state"
 }
 
 # ── CLI dispatch when run directly ───────────────────────────────────────────
+# Direct invocation re-execs into a user+net namespace, builds the lab, and
+# (for `up`) sleeps so the operator can inspect it from inside the same userns.
 if [ "${BASH_SOURCE[0]}" = "${0}" ]; then
+    if [ "${LAB_INNER:-}" != "1" ]; then
+        exec env LAB_INNER=1 unshare -rmn --propagation private bash "$0" "$@"
+    fi
     cmd="${1:-}"
     case "$cmd" in
-        up)     lab_down; lab_up "${2:-3}" ;;
-        down)   lab_down ;;
-        routes) lab_route_table "${2:-0}" ;;
-        link)   lab_link_set "${2:?i}" "${3:?j}" "${4:?up|down}" ;;
+        up)
+            trap lab_down EXIT
+            lab_up "${2:-3}"
+            echo "lab up (${2:-3} nodes); PIDs: ${NODE_PID[*]}. Ctrl-C to tear down." >&2
+            sleep infinity
+            ;;
         *)
-            echo "usage: $0 {up <N>|down|routes <i>|link <i> <j> up|down}" >&2
+            echo "usage (rootless, no sudo): $0 up <N>" >&2
+            echo "  (routes/link/down are only meaningful from inside the userns;" >&2
+            echo "   use demo.sh, which drives the full lab + assertions)" >&2
             exit 2
             ;;
     esac

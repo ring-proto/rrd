@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
-# harness/demo.sh — the LIVE M3 validation: RING routes real packets.
+# harness/demo.sh — the LIVE M3 validation: RING routes real packets, ROOTLESS.
 #
 # Builds the rrd release binary, stands up a 3-node line topology
 # (ring0—ring1—ring2) via harness/lab.sh, and asserts the milestone behaviour
-# against the *real* kernel FIB and ICMPv6 datapath:
+# against the *real* kernel FIB and ICMPv6 datapath — all WITHOUT sudo:
 #
 #   1. proto-ring routes install (ring0 learns the 2-hop prefix fd00:a2::/64,
 #      ring2 learns fd00:a0::/64).
@@ -15,18 +15,31 @@
 #
 # Prints `DEMO: PASS` only if the CORE (routes install AND the 2-hop ping
 # delivers) holds; the cut/heal cycle is asserted too and folded into the
-# verdict. Must be run as root / via sudo (netns + rtnetlink + ping need it):
+# verdict.
 #
-#   sudo bash harness/demo.sh
+# ── Rootless execution model ─────────────────────────────────────────────────
+# Run with NO sudo:
 #
-# Namespaces are always cleaned up via an exit trap, even on failure.
+#   bash harness/demo.sh
+#
+# The script builds the binary as the invoking user, then RE-EXECS its
+# privileged body inside a single unprivileged user+net namespace
+# (`unshare -rmn --propagation private`).  Inside that namespace the script is
+# root-in-userns with CAP_NET_ADMIN, so it can create veth pairs, per-node
+# anonymous netns (held by placeholder PIDs — see lab.sh), set sysctls, install
+# rtnetlink routes and join IPv6 multicast — none of which needs real root.
+# This requires unprivileged user namespaces to be enabled, e.g.
+#   sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+#
+# All placeholder/daemon processes are killed via an exit trap, even on failure,
+# and the anonymous namespaces vanish with their placeholder PIDs — nothing to
+# `ip netns del`, nothing leaks.
 
 set -u
 
 DEMO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${DEMO_DIR}/.." && pwd)"
-# shellcheck source=lab.sh
-source "${DEMO_DIR}/lab.sh"
+RRD_BIN="${RRD_BIN:-${REPO_ROOT}/target/release/rrd}"
 
 # ── Tunables (widen waits here if a stage is flaky) ──────────────────────────
 CONVERGE_TIMEOUT=10     # seconds to wait for initial route install
@@ -34,6 +47,7 @@ SEVER_WAIT=4            # seconds to wait for a cut to propagate (withdraw)
 HEAL_WAIT=6             # seconds to wait for a heal to reconverge
 PING_COUNT=3            # echo requests per ping probe
 PING_W=1                # per-packet ping timeout (s)
+NODES=3                 # line length (ring0 … ring(NODES-1))
 
 # Target destinations.
 DST2="fd00:a2::1"       # ring2's host address (2 hops from ring0)
@@ -41,13 +55,51 @@ DST2_PFX="fd00:a2::/64" # ring2's prefix (what ring0 must install)
 RING0_LEARNS="$DST2_PFX"
 RING2_LEARNS="fd00:a0::/64"
 
+# ── Stage 1: build (OUTSIDE the namespace, as the invoking user) ─────────────
+# Done before the re-exec so the user's cargo/rustup toolchain is used directly
+# (no sudo, no namespace quirks), and so a build failure aborts before we touch
+# any namespaces.
+if [ "${DEMO_INNER:-}" != "1" ]; then
+    printf '\n\033[1m== build (cargo build --release -p rrd) ==\033[0m\n'
+    if ( cd "$REPO_ROOT" && cargo build --release -p rrd ); then
+        printf '  \033[32mPASS\033[0m release binary built\n'
+    else
+        printf '  \033[31mFAIL\033[0m build failed\n'
+        exit 1
+    fi
+    if [ ! -x "$RRD_BIN" ]; then
+        printf '  \033[31mFAIL\033[0m release binary missing at %s\n' "$RRD_BIN"
+        exit 1
+    fi
+
+    # Pre-flight: unprivileged user namespaces must be available.
+    if ! unshare -rmn --propagation private true 2>/dev/null; then
+        printf '  \033[31mFAIL\033[0m cannot create an unprivileged user namespace.\n' >&2
+        printf '        Enable it, e.g.:  sysctl -w kernel.apparmor_restrict_unprivileged_userns=0\n' >&2
+        exit 1
+    fi
+
+    # Re-exec the privileged body inside ONE user+net namespace.  Everything
+    # below the guard runs as root-in-userns with CAP_NET_ADMIN — no sudo.
+    exec env DEMO_INNER=1 RRD_BIN="$RRD_BIN" \
+        unshare -rmn --propagation private bash "$0" "$@"
+fi
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Everything below here runs INSIDE the user+net namespace (DEMO_INNER=1).
+# ─────────────────────────────────────────────────────────────────────────────
+
+# shellcheck source=lab.sh
+source "${DEMO_DIR}/lab.sh"
+
 # ── Result tracking ──────────────────────────────────────────────────────────
 FAILS=0
 note()  { printf '\n\033[1m== %s ==\033[0m\n' "$*"; }
 pass()  { printf '  \033[32mPASS\033[0m %s\n' "$*"; }
 fail()  { printf '  \033[31mFAIL\033[0m %s\n' "$*"; FAILS=$((FAILS + 1)); }
 
-# Always tear the lab down on exit.
+# Always tear the lab down on exit (kills placeholders + daemons; namespaces
+# vanish with their placeholder PIDs).
 cleanup() { note "cleanup"; lab_down; }
 trap cleanup EXIT
 
@@ -56,7 +108,7 @@ trap cleanup EXIT
 # has_route <node> <prefix> : succeed if `ip -6 route show proto ring` on the
 # node contains the prefix.
 has_route() {
-    ip netns exec "$(ns "$1")" ip -6 route show proto ring 2>/dev/null | grep -q "$2"
+    nsx "$1" ip -6 route show proto ring 2>/dev/null | grep -q "$2"
 }
 
 # wait_route <node> <prefix> <timeout_s> : poll until the route appears.
@@ -81,11 +133,10 @@ wait_no_route() {
     return 1
 }
 
-# ping_ok <node> <dst> : succeed if ping6 delivers at least one reply
-# (tolerates up to 1 lost packet of PING_COUNT).
+# ping_ok <node> <dst> : succeed if ping6 delivers at least PING_COUNT-1 replies.
 ping_ok() {
     local out
-    out="$(ip netns exec "$(ns "$1")" ping6 -c "$PING_COUNT" -W "$PING_W" "$2" 2>&1)"
+    out="$(nsx "$1" ping6 -c "$PING_COUNT" -W "$PING_W" "$2" 2>&1)"
     echo "$out"
     local recv
     recv="$(echo "$out" | grep -oE '[0-9]+ received' | grep -oE '^[0-9]+')"
@@ -94,32 +145,8 @@ ping_ok() {
 
 # ── Run ──────────────────────────────────────────────────────────────────────
 
-note "build (cargo build --release -p rrd)"
-# When run under sudo, cargo/rustup live in the *invoking* user's home and root
-# has no default toolchain — so build as that user, then run the privileged
-# netns/ping steps as root. Fall back to a plain cargo build if not under sudo.
-build_rrd() {
-    if [ -n "${SUDO_USER:-}" ] && [ "${SUDO_USER}" != "root" ]; then
-        sudo -u "$SUDO_USER" -H bash -lc \
-            "cd '$REPO_ROOT' && cargo build --release -p rrd"
-    else
-        ( cd "$REPO_ROOT" && cargo build --release -p rrd )
-    fi
-}
-if build_rrd; then
-    pass "release binary built"
-else
-    fail "build failed"
-    exit 1
-fi
-if [ ! -x "$RRD_BIN" ]; then
-    fail "release binary missing at $RRD_BIN"
-    exit 1
-fi
-
-note "lab_up 3  (ring0 — ring1 — ring2)"
-lab_down
-lab_up 3 || { fail "lab_up failed"; exit 1; }
+note "lab_up ${NODES}  (ring0 — ring1 — ring2)  [rootless: PID-based netns]"
+lab_up "$NODES" || { fail "lab_up failed"; exit 1; }
 
 note "wait for convergence (proto-ring routes install)"
 if wait_route 0 "$RING0_LEARNS" "$CONVERGE_TIMEOUT" \
@@ -189,8 +216,6 @@ note "verdict"
 echo "  core (routes + 2-hop ping):    $( [ "${CORE_OK:-0}" = 1 ] && echo OK || echo FAILED )"
 echo "  total sub-assertion failures:  $FAILS"
 
-# DEMO: PASS requires (at minimum) the CORE to hold. The cut/heal assertions are
-# folded into FAILS, so a fully clean run reports PASS with FAILS=0.
 if [ "${CORE_OK:-0}" = 1 ] && [ "$FAILS" -eq 0 ]; then
     echo
     echo "DEMO: PASS"
