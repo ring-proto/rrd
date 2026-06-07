@@ -167,6 +167,10 @@ impl Fabric {
         self.time
     }
 
+    pub(crate) fn node_up(&self, node: usize) -> bool {
+        self.nodes[node].up
+    }
+
     /// The `RouterId` of node `i` (for `route`/data-plane queries).
     pub fn router_id(&self, i: usize) -> RouterId {
         self.nodes[i].id.clone()
