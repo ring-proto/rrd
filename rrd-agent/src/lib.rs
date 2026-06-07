@@ -17,6 +17,7 @@ pub const DEFAULT_CONTROL_SOCKET: &str = "/run/rrd/control.sock";
 pub struct AgentConfig {
     pub event_socket: PathBuf,
     pub control_socket: PathBuf,
+    pub rrd_control_socket: Option<PathBuf>,
 }
 
 impl AgentConfig {
@@ -24,7 +25,13 @@ impl AgentConfig {
         Self {
             event_socket: event_socket.into(),
             control_socket: control_socket.into(),
+            rrd_control_socket: None,
         }
+    }
+
+    pub fn with_rrd_control_socket(mut self, socket: impl Into<PathBuf>) -> Self {
+        self.rrd_control_socket = Some(socket.into());
+        self
     }
 }
 
@@ -124,6 +131,12 @@ impl PodRecord {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RrdOriginCommand {
+    Add { dest: String, prefix: String },
+    Remove { dest: String },
+}
+
 #[derive(Debug, Default)]
 pub struct AgentState {
     pods: BTreeMap<String, PodRecord>,
@@ -135,7 +148,7 @@ pub struct AgentState {
 }
 
 impl AgentState {
-    pub fn apply_event(&mut self, event: PodEvent) {
+    pub fn apply_event(&mut self, event: PodEvent) -> Vec<RrdOriginCommand> {
         self.events_seen += 1;
         let now = unix_ms();
         match event.event_type.as_str() {
@@ -143,8 +156,9 @@ impl AgentState {
                 self.add_events += 1;
                 if event.container_id.is_empty() {
                     self.invalid_events += 1;
-                    return;
+                    return Vec::new();
                 }
+                let origins = add_origin_commands(&event);
                 match self.pods.get_mut(&event.container_id) {
                     Some(record) => record.refresh_from_event(event, now),
                     None => {
@@ -154,20 +168,29 @@ impl AgentState {
                         );
                     }
                 }
+                origins
             }
             "pod_deleted" => {
                 self.delete_events += 1;
                 if event.container_id.is_empty() {
                     self.invalid_events += 1;
+                    Vec::new()
                 } else {
-                    self.pods.remove(&event.container_id);
+                    let removed = self.pods.remove(&event.container_id);
+                    let dest = removed
+                        .as_ref()
+                        .map(pod_origin_dest)
+                        .unwrap_or_else(|| event_origin_dest(&event));
+                    vec![RrdOriginCommand::Remove { dest }]
                 }
             }
             "pod_checked" => {
                 self.check_events += 1;
+                Vec::new()
             }
             _ => {
                 self.invalid_events += 1;
+                Vec::new()
             }
         }
     }
@@ -193,6 +216,59 @@ impl AgentState {
     }
 }
 
+fn add_origin_commands(event: &PodEvent) -> Vec<RrdOriginCommand> {
+    let dest = event_origin_dest(event);
+    event
+        .ips
+        .iter()
+        .filter_map(|ip| normalize_ipv6_prefix(ip))
+        .map(|prefix| RrdOriginCommand::Add {
+            dest: dest.clone(),
+            prefix,
+        })
+        .collect()
+}
+
+fn event_origin_dest(event: &PodEvent) -> String {
+    pod_namespace_name_from_args(&event.args)
+        .map(|(namespace, name)| format!("pod:{namespace}/{name}"))
+        .unwrap_or_else(|| format!("container:{}", event.container_id))
+}
+
+fn pod_origin_dest(record: &PodRecord) -> String {
+    pod_namespace_name_from_args(&record.args)
+        .map(|(namespace, name)| format!("pod:{namespace}/{name}"))
+        .unwrap_or_else(|| format!("container:{}", record.container_id))
+}
+
+fn pod_namespace_name_from_args(args: &str) -> Option<(String, String)> {
+    let mut namespace = None;
+    let mut name = None;
+    for part in args.split(';') {
+        let Some((key, value)) = part.split_once('=') else {
+            continue;
+        };
+        match key {
+            "K8S_POD_NAMESPACE" if !value.is_empty() => namespace = Some(value.to_string()),
+            "K8S_POD_NAME" if !value.is_empty() => name = Some(value.to_string()),
+            _ => {}
+        }
+    }
+    Some((namespace?, name?))
+}
+
+fn normalize_ipv6_prefix(input: &str) -> Option<String> {
+    let (addr, len) = input
+        .split_once('/')
+        .map_or((input, "128"), |(addr, len)| (addr, len));
+    let addr = addr.parse::<std::net::Ipv6Addr>().ok()?;
+    let len: u8 = len.parse().ok()?;
+    if len > 128 {
+        return None;
+    }
+    Some(format!("{addr}/{len}"))
+}
+
 #[derive(Debug, Deserialize)]
 struct ControlRequest {
     #[serde(rename = "type")]
@@ -206,6 +282,7 @@ pub async fn run_agent(
     let event_listener = bind_socket(&config.event_socket)?;
     let control_listener = bind_socket(&config.control_socket)?;
     let state = Arc::new(Mutex::new(AgentState::default()));
+    let rrd_control_socket = Arc::new(config.rrd_control_socket.clone());
 
     loop {
         tokio::select! {
@@ -215,8 +292,9 @@ pub async fn run_agent(
             accepted = event_listener.accept() => {
                 let (stream, _) = accepted.map_err(AgentError::EventAccept)?;
                 let state = Arc::clone(&state);
+                let rrd_control_socket = Arc::clone(&rrd_control_socket);
                 tokio::spawn(async move {
-                    if let Err(error) = handle_event_stream(stream, state).await {
+                    if let Err(error) = handle_event_stream(stream, state, rrd_control_socket).await {
                         tracing::warn!(%error, "event stream failed");
                     }
                 });
@@ -241,6 +319,7 @@ pub async fn run_agent(
 async fn handle_event_stream(
     stream: UnixStream,
     state: Arc<Mutex<AgentState>>,
+    rrd_control_socket: Arc<Option<PathBuf>>,
 ) -> Result<(), std::io::Error> {
     let mut reader = BufReader::new(stream);
     let mut line = String::new();
@@ -255,12 +334,52 @@ async fn handle_event_stream(
             continue;
         }
         match serde_json::from_str::<PodEvent>(trimmed) {
-            Ok(event) => state.lock().await.apply_event(event),
+            Ok(event) => {
+                let commands = state.lock().await.apply_event(event);
+                for command in commands {
+                    if let Some(socket) = rrd_control_socket.as_ref() {
+                        if let Err(error) = send_rrd_origin_command(socket, &command).await {
+                            tracing::warn!(%error, "failed to forward local origin to rrd");
+                        }
+                    }
+                }
+            }
             Err(error) => {
                 tracing::warn!(%error, payload = trimmed, "invalid CNI lifecycle event");
                 state.lock().await.invalid_events += 1;
             }
         }
+    }
+}
+
+async fn send_rrd_origin_command(
+    socket: &Path,
+    command: &RrdOriginCommand,
+) -> Result<(), std::io::Error> {
+    let payload = match command {
+        RrdOriginCommand::Add { dest, prefix } => json!({
+            "type": "add_local_origin",
+            "dest": dest,
+            "prefix": prefix,
+        }),
+        RrdOriginCommand::Remove { dest } => json!({
+            "type": "remove_local_origin",
+            "dest": dest,
+        }),
+    };
+
+    let mut stream = UnixStream::connect(socket).await?;
+    stream
+        .write_all(format!("{}\n", payload).as_bytes())
+        .await?;
+    let mut reader = BufReader::new(stream);
+    let mut line = String::new();
+    reader.read_line(&mut line).await?;
+    let response: Value = serde_json::from_str(line.trim()).map_err(std::io::Error::other)?;
+    if response.get("type").and_then(|value| value.as_str()) == Some("ok") {
+        Ok(())
+    } else {
+        Err(std::io::Error::other(response.to_string()))
     }
 }
 

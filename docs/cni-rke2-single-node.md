@@ -7,6 +7,45 @@ Status: M1 live chained CNI observer is installed on the local RKE2/Flannel node
 - `rrdctl` is installed in `/usr/local/bin/rrdctl`.
 - Flannel's active conflist appends `rrd-cni` after `flannel -> portmap -> bandwidth`.
 
+## rrd core integration
+
+`rrd-agent` can now bridge CNI pod lifecycle events into the core `rrd` daemon's dynamic local-origin API. CNI remains only a lifecycle/input surface; RRD core remains the system-level routing protocol and dataplane owner.
+
+Run `rrd` with a control socket, for example:
+
+```bash
+rrd --router-id spark --prefix fd00:7264::/64 --iface <iface> --control-socket /run/rrd/rrd.sock
+```
+
+Then run `rrd-agent` with forwarding enabled:
+
+```bash
+rrd-agent \
+  --event-socket /run/rrd/agent.sock \
+  --control-socket /run/rrd/control.sock \
+  --rrd-control-socket /run/rrd/rrd.sock
+```
+
+On CNI `ADD`, the agent derives a destination id from `CNI_ARGS` when available:
+
+```text
+K8S_POD_NAMESPACE=default;K8S_POD_NAME=smoke -> pod:default/smoke
+```
+
+and forwards IPv6 pod addresses to `rrd` as dynamic local origins:
+
+```json
+{"type":"add_local_origin","dest":"pod:default/smoke","prefix":"fd00:ffff::1/128"}
+```
+
+On CNI `DEL`, it forwards:
+
+```json
+{"type":"remove_local_origin","dest":"pod:default/smoke"}
+```
+
+Current bridge scope is intentionally IPv6-only because `ring-core::Prefix` is still IPv6-native. IPv4 pod addresses are retained in `rrd-agent` pod state but are not forwarded as RRD origins yet; the planned direction is to support IPv4 destinations via IPv6 next-hops at the FIB layer rather than building a separate IPv4 adapter.
+
 ## What exists now
 
 `rrd-cni` is a short-lived CNI plugin intended for chained mode.

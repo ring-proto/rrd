@@ -12,6 +12,9 @@ struct Args {
     event_socket: PathBuf,
     #[arg(long, default_value = DEFAULT_CONTROL_SOCKET)]
     control_socket: PathBuf,
+    /// Optional rrd daemon control socket for pod lifecycle -> local-origin forwarding.
+    #[arg(long)]
+    rrd_control_socket: Option<PathBuf>,
 }
 
 #[tokio::main]
@@ -32,10 +35,15 @@ async fn main() -> anyhow::Result<()> {
     tracing::info!(
         event_socket = %args.event_socket.display(),
         control_socket = %args.control_socket.display(),
+        rrd_control_socket = ?args.rrd_control_socket,
         "rrd-agent starting"
     );
+    let mut config = AgentConfig::new(args.event_socket, args.control_socket);
+    if let Some(socket) = args.rrd_control_socket {
+        config = config.with_rrd_control_socket(socket);
+    }
     run_agent(
-        AgentConfig::new(args.event_socket, args.control_socket),
+        config,
         shutdown_rx,
     )
     .await?;
