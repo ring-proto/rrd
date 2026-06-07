@@ -3,7 +3,7 @@
 use crate::config::{Config, ForwardingPolicy};
 use crate::ids::{NeighborId, Prefix, RouterId};
 use crate::math::{age, reg};
-use crate::message::{Entry, Message, Route, StepOutput, WeightedHop};
+use crate::message::{DesiredRoute, Entry, Message, Route, StepOutput, WeightedHop};
 use crate::{ticks_between, Mono};
 use smallvec::SmallVec;
 use std::collections::HashMap;
@@ -253,6 +253,34 @@ impl Engine {
         }
     }
 
+    /// The FIB reconciler's view: one `DesiredRoute` per KNOWN, non-self destination, with the
+    /// weighted next-hops capped to `ForwardingPolicy.max_paths` (the multipath set is computed in
+    /// full by `step`; the policy decides how much to install), and `routable = known ∧ V ≥ φ` with
+    /// `V` aged to `now`. `known = f ≥ floor ∧ via defined`; unknown destinations are skipped.
+    pub fn desired_routes(&self, now: Mono) -> impl Iterator<Item = DesiredRoute> + '_ {
+        let drift = ticks_between(self.last_aged, now, self.cfg.tick);
+        (0..self.ndest()).filter_map(move |d| {
+            if d == self.self_slot {
+                return None;
+            }
+            let known = self.f[d] >= self.cfg.floor && self.dominant[d].is_some();
+            if !known {
+                return None;
+            }
+            let v = age(self.cfg.alpha, self.vit[d], drift);
+            let nexthops: SmallVec<[WeightedHop; 4]> = self.hops[d]
+                .iter()
+                .take(self.policy.max_paths.max(1))
+                .copied()
+                .collect();
+            Some(DesiredRoute {
+                prefix: self.dest_prefix[d],
+                nexthops,
+                routable: v >= self.cfg.phi,
+            })
+        })
+    }
+
     fn age_all(&mut self, now: Mono) {
         let ticks = ticks_between(self.last_aged, now, self.cfg.tick);
         if ticks <= 0.0 {
@@ -431,5 +459,56 @@ mod tests {
         assert_eq!(hops[0].via, NeighborId(2));
         assert!(hops[0].weight > hops[1].weight, "fat link dominates");
         assert_eq!(a.route(cfg.tick * 3, &RouterId::from("d")).unwrap().via, Some(NeighborId(2)));
+    }
+
+    #[test]
+    fn desired_routes_yields_capped_routable_entries() {
+        let cfg = Config::default();
+        let mut a = Engine::new(RouterId::from("a"), px(1), cfg, Default::default());
+        a.add_neighbor(NeighborId(1));
+        a.add_neighbor(NeighborId(2));
+        let mk = |from: &str| Message {
+            from: RouterId::from(from),
+            hears: vec![RouterId::from("a")],
+            delta: vec![Entry { dest: RouterId::from("d"), prefix: px(9), pot: 0.9, vit: 1.0 }],
+        };
+        for k in 0..3u32 {
+            let now = cfg.tick * k;
+            a.ingest(now, NeighborId(1), &mk("n1"));
+            a.ingest(now, NeighborId(2), &mk("n2"));
+            a.step(now);
+        }
+        let routes: Vec<_> = a.desired_routes(cfg.tick * 3).collect();
+        let d = routes.iter().find(|r| r.prefix == px(9)).expect("d present");
+        assert!(d.routable);
+        assert_eq!(d.nexthops.len(), 1, "max_paths default = 1");
+        // self is never a desired route
+        assert!(routes.iter().all(|r| r.prefix != px(1)));
+    }
+
+    #[test]
+    fn gate_closes_when_vitality_decays_below_phi() {
+        let cfg = Config::default();
+        let mut a = Engine::new(RouterId::from("a"), px(1), cfg, Default::default());
+        a.add_neighbor(NeighborId(1));
+        // Learn d once (vit=1), establish the field, then go silent.
+        let msg = Message {
+            from: RouterId::from("n1"),
+            hears: vec![RouterId::from("a")],
+            delta: vec![Entry { dest: RouterId::from("d"), prefix: px(9), pot: 0.9, vit: 1.0 }],
+        };
+        for k in 0..3u32 {
+            let now = cfg.tick * k;
+            a.ingest(now, NeighborId(1), &msg);
+            a.step(now);
+        }
+        assert!(a.route(cfg.tick * 3, &RouterId::from("d")).unwrap().routable);
+
+        // No more ingest: vitality ages toward 0. Far past the horizon R_V=(1/φ−1)/α the read
+        // drops below φ.
+        let far = cfg.tick * 5000;
+        let r = a.route(far, &RouterId::from("d")).unwrap();
+        assert!(!r.routable, "should sever once V < φ (V={})", r.vit);
+        assert!(r.via.is_some(), "direction is still known — severance is not deletion");
     }
 }
