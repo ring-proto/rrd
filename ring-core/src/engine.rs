@@ -3,7 +3,7 @@
 use crate::config::{Config, ForwardingPolicy};
 use crate::ids::{NeighborId, Prefix, RouterId};
 use crate::math::{age, reg};
-use crate::message::{Entry, Message, StepOutput, WeightedHop};
+use crate::message::{Entry, Message, Route, StepOutput, WeightedHop};
 use crate::{ticks_between, Mono};
 use smallvec::SmallVec;
 use std::collections::HashMap;
@@ -122,6 +122,22 @@ impl Engine {
     /// Test/inspection helper: vitality toward `dest` as currently stored (un-aged-to-now).
     pub fn peek_vit(&self, dest: &RouterId) -> Option<f64> {
         self.dest_slot.get(dest).map(|&d| self.vit[d])
+    }
+
+    /// Test/inspection helper: routing potential toward `dest`.
+    pub fn peek_pot(&self, dest: &RouterId) -> Option<f64> {
+        self.dest_slot.get(dest).map(|&d| self.f[d])
+    }
+
+    /// The data-plane read: dominant next-hop, vitality aged to `now`, and the routability gate
+    /// `known ∧ V ≥ φ`, where `known = f ≥ floor ∧ via defined`. Returns `None` only when `dest`
+    /// has never been interned (never heard of); a known-but-degraded destination returns
+    /// `Some` with `routable = false` and the direction still populated.
+    pub fn route(&self, now: Mono, dest: &RouterId) -> Option<Route> {
+        let &d = self.dest_slot.get(dest)?;
+        let v = age(self.cfg.alpha, self.vit[d], ticks_between(self.last_aged, now, self.cfg.tick));
+        let known = self.f[d] >= self.cfg.floor && self.dominant[d].is_some();
+        Some(Route { via: self.dominant[d], vit: v, routable: known && v >= self.cfg.phi })
     }
 
     /// Return the dense slot for `key`, allocating (and growing every dense vector, including
@@ -332,5 +348,40 @@ mod tests {
         a.ingest(Duration::ZERO, NeighborId(1), &one_way);
         assert!(a.step(Duration::ZERO).emit.hears.contains(&RouterId::from("b")),
                 "A hears B (one-way) and should echo it");
+    }
+
+    /// Feed A a steady advertisement from neighbour B (the destination, pinning F0 and hearing A).
+    /// B's advertised potential is a fixed constant, so once the two-way handshake completes A's
+    /// potential toward B settles at the single-neighbour screened-balance FIXED POINT D·F0/(D+κ)
+    /// — a closed-form check reached as soon as the link is bidirectional, NOT a multi-round
+    /// transient (genuine multi-hop convergence is exercised by the Task 10 mesh test). A's via
+    /// toward B is that neighbour and the route is routable (V well above φ).
+    #[test]
+    fn two_node_screened_balance_fixed_point() {
+        let cfg = Config::default();
+        let mut a = Engine::new(RouterId::from("a"), px(1), cfg, Default::default());
+        a.add_neighbor(NeighborId(1));
+
+        let b_msg = Message {
+            from: RouterId::from("b"),
+            hears: vec![RouterId::from("a")],
+            delta: vec![Entry { dest: RouterId::from("b"), prefix: px(2), pot: cfg.f0, vit: 1.0 }],
+        };
+
+        // Drive a few rounds: ingest B's advert, then step, advancing time by one tick each round.
+        let tick = cfg.tick;
+        for k in 0..5u32 {
+            let now = tick * k;
+            a.ingest(now, NeighborId(1), &b_msg);
+            a.step(now);
+        }
+
+        let f = a.peek_pot(&RouterId::from("b")).unwrap();
+        let expected = cfg.d * cfg.f0 / (cfg.d + cfg.kappa); // 1/(1.05) ≈ 0.95238
+        assert!((f - expected).abs() < 1e-9, "f={f} expected={expected}");
+
+        let route = a.route(tick * 5, &RouterId::from("b")).unwrap();
+        assert_eq!(route.via, Some(NeighborId(1)));
+        assert!(route.routable, "V≈0.93 ≥ φ=0.5 and f≈0.95 ≥ floor ⇒ routable");
     }
 }
