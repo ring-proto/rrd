@@ -9,6 +9,7 @@ use smallvec::SmallVec;
 use std::collections::HashMap;
 
 struct Peer {
+    id: Option<RouterId>, // learned from the first message's `from`
     g: f64,
     pot: Vec<f64>, // dense over local dest slots; 0.0 = not yet learned
     hears: bool,
@@ -70,6 +71,57 @@ impl Engine {
         };
         e.self_slot = e.intern_dest(id, prefix);
         e
+    }
+
+    pub fn add_neighbor(&mut self, n: NeighborId) {
+        let pot = vec![0.0; self.ndest()];
+        self.neighbors.entry(n).or_insert(Peer {
+            id: None,
+            g: self.cfg.d,
+            pot,
+            hears: false,
+            heard: Mono::ZERO,
+        });
+    }
+
+    pub fn drop_neighbor(&mut self, n: NeighborId) {
+        self.neighbors.remove(&n);
+    }
+
+    /// Fold a neighbour's advertisement: store its advertised potentials, and for each entry
+    /// perform the retarded adopt-max of vitality `V[d] = max(V[d], age(vit, transit))` with
+    /// `transit = 1` tick (clock-free) or `0` under the `no_retard` ablation.
+    pub fn ingest(&mut self, now: Mono, from: NeighborId, msg: &Message) {
+        if !self.neighbors.contains_key(&from) {
+            return; // not a wired neighbour
+        }
+        self.age_all(now);
+        let transit = if self.cfg.no_retard { 0.0 } else { 1.0 };
+        let hears = msg.hears.iter().any(|r| *r == self.id);
+
+        for e in &msg.delta {
+            if e.dest == self.id {
+                continue; // our own field is pinned locally
+            }
+            let d = self.intern_dest(e.dest.clone(), e.prefix);
+            self.neighbors.get_mut(&from).unwrap().pot[d] = e.pot;
+            let v = age(self.cfg.alpha, e.vit, transit);
+            if v > self.vit[d] {
+                self.vit[d] = v;
+            }
+        }
+
+        let p = self.neighbors.get_mut(&from).unwrap();
+        if p.id.is_none() {
+            p.id = Some(msg.from.clone());
+        }
+        p.hears = hears;
+        p.heard = now;
+    }
+
+    /// Test/inspection helper: vitality toward `dest` as currently stored (un-aged-to-now).
+    pub fn peek_vit(&self, dest: &RouterId) -> Option<f64> {
+        self.dest_slot.get(dest).map(|&d| self.vit[d])
     }
 
     /// Return the dense slot for `key`, allocating (and growing every dense vector, including
@@ -194,10 +246,19 @@ impl Engine {
         out
     }
 
-    /// Stub for Task 4 (no neighbour is bidirectional yet); completed in Task 5 once `Peer`
-    /// carries the neighbour's RouterId to echo.
-    fn heard_list(&self, _now: Mono) -> Vec<RouterId> {
-        Vec::new()
+    /// The neighbours we currently hear (freshness only — ONE-WAY, regardless of `hears`) — the
+    /// `Hears` echo we advertise. This is intentionally distinct from `bidir`, which additionally
+    /// requires the two-way `hears` flag for relaxation/forwarding.
+    fn heard_list(&self, now: Mono) -> Vec<RouterId> {
+        let mut out = Vec::new();
+        for p in self.neighbors.values() {
+            if let Some(id) = &p.id {
+                if ticks_between(p.heard, now, self.cfg.tick) < self.cfg.fresh {
+                    out.push(id.clone());
+                }
+            }
+        }
+        out
     }
 }
 
@@ -225,5 +286,51 @@ mod tests {
         assert_eq!(pin.dest, RouterId::from("a"));
         assert_eq!(pin.pot, cfg.f0);
         assert_eq!(pin.vit, 1.0);
+    }
+
+    #[test]
+    fn ingest_learns_destination_and_adopts_retarded_vitality() {
+        let cfg = Config::default();
+        let mut a = Engine::new(RouterId::from("a"), px(1), cfg, Default::default());
+        a.add_neighbor(NeighborId(1));
+        // B advertises its self-pin (live: vit=1) and that it hears A.
+        let msg = Message {
+            from: RouterId::from("b"),
+            hears: vec![RouterId::from("a")],
+            delta: vec![Entry { dest: RouterId::from("b"), prefix: px(2), pot: cfg.f0, vit: 1.0 }],
+        };
+        a.ingest(Duration::ZERO, NeighborId(1), &msg);
+        // Vitality toward b is adopted aged by one tick of transit: 1/(1+α).
+        let v = a.peek_vit(&RouterId::from("b")).unwrap();
+        let expected = age(cfg.alpha, 1.0, 1.0);
+        assert!((v - expected).abs() < 1e-12, "{v} vs {expected}");
+    }
+
+    #[test]
+    fn no_retard_adopts_vitality_unaged() {
+        let mut cfg = Config::default();
+        cfg.no_retard = true;
+        let mut a = Engine::new(RouterId::from("a"), px(1), cfg, Default::default());
+        a.add_neighbor(NeighborId(1));
+        let msg = Message {
+            from: RouterId::from("b"),
+            hears: vec![RouterId::from("a")],
+            delta: vec![Entry { dest: RouterId::from("b"), prefix: px(2), pot: 1.0, vit: 1.0 }],
+        };
+        a.ingest(Duration::ZERO, NeighborId(1), &msg);
+        // un-retarded: adopted raw at 1.0 (the spurious-resurrection mechanism, Thm 6.2).
+        assert_eq!(a.peek_vit(&RouterId::from("b")).unwrap(), 1.0);
+    }
+
+    #[test]
+    fn ingest_sets_bidirectional_echo() {
+        let cfg = Config::default();
+        let mut a = Engine::new(RouterId::from("a"), px(1), cfg, Default::default());
+        a.add_neighbor(NeighborId(1));
+        // B does NOT list A in Hears yet → one-way; A still echoes hearing B (one-way freshness).
+        let one_way = Message { from: RouterId::from("b"), hears: vec![], delta: vec![] };
+        a.ingest(Duration::ZERO, NeighborId(1), &one_way);
+        assert!(a.step(Duration::ZERO).emit.hears.contains(&RouterId::from("b")),
+                "A hears B (one-way) and should echo it");
     }
 }
