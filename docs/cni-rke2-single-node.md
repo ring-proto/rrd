@@ -73,7 +73,12 @@ Use Flannel rather than the RKE2 default Canal for the RRD lab host. Flannel is 
 
 ```bash
 sudo mkdir -p /etc/rancher/rke2
-printf 'cni: flannel\n' | sudo tee /etc/rancher/rke2/config.yaml
+sudo tee /etc/rancher/rke2/config.yaml <<'EOF'
+tls-san:
+- spark.local
+cni: flannel
+cluster-domain: spark.local
+EOF
 curl -sfL https://get.rke2.io | sudo sh -
 sudo systemctl enable --now rke2-server
 sudo systemctl status rke2-server --no-pager
@@ -112,7 +117,10 @@ RKE2 docs note that bundled CNIs include Canal, Cilium, Calico, and Flannel, wit
 This host was brought up with:
 
 ```yaml
+tls-san:
+- spark.local
 cni: flannel
+cluster-domain: spark.local
 ```
 
 Verified state:
@@ -126,6 +134,8 @@ CNI config: /etc/cni/net.d/10-flannel.conflist
 CNI binary: /opt/cni/bin/flannel
 pod CIDR: 10.42.0.0/16
 service CIDR: 10.43.0.0/16
+cluster domain: spark.local
+cluster DNS: 10.43.0.10
 ```
 
 The active CNI conflist is:
@@ -158,7 +168,22 @@ The active CNI conflist is:
 }
 ```
 
-DNS smoke from a temporary BusyBox pod resolved fully-qualified cluster service names, e.g. `kubernetes.default.svc.cluster.local -> 10.43.0.1`. BusyBox's short-name `nslookup kubernetes.default.svc` returned NXDOMAIN despite the pod search domains being present; use FQDNs in smoke tests to avoid BusyBox resolver ambiguity.
+DNS smoke from temporary BusyBox pods resolved:
+
+- `kubernetes.default.svc.spark.local -> 10.43.0.1`
+- `rke2-coredns-rke2-coredns.kube-system.svc.spark.local -> 10.43.0.10`
+
+The pod resolver search path is now:
+
+```text
+search default.svc.spark.local svc.spark.local spark.local
+nameserver 10.43.0.10
+options ndots:5
+```
+
+BusyBox `nslookup kubernetes.default.svc` still returned NXDOMAIN because BusyBox `nslookup` does not reliably apply the pod search suffixes. Real libc-style resolution did work: BusyBox `wget https://kubernetes.default.svc/version` and `wget https://kubernetes.default.svc.spark.local/version` both reached the API server and returned HTTP 401, which proves DNS/connectivity worked.
+
+Note: `.local` is mDNS-reserved outside Kubernetes. That is intentional here because the host is reached as `spark.local`; keep in mind that host-level `.local` lookups and in-cluster CoreDNS `.spark.local` are separate resolver contexts.
 
 ## First chained CNI config sketch
 
