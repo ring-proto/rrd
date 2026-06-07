@@ -21,7 +21,7 @@ use std::collections::HashMap;
 use std::future::Future;
 use std::net::Ipv6Addr;
 use std::time::Instant;
-use tokio::sync::watch;
+use tokio::sync::{mpsc, watch};
 use tokio::time;
 
 /// A base offset added to every `now()` so the first engine age is harmless.
@@ -35,6 +35,13 @@ fn base_offset(tick: Mono) -> Mono {
 pub struct RibSnapshot {
     /// Destinations currently routable: `(router-id, their announced prefix)`.
     pub routable: Vec<(RouterId, Prefix)>,
+}
+
+/// Runtime command for destinations dynamically originated by this node.
+#[derive(Clone, Debug)]
+pub enum LocalOriginCommand {
+    Add { dest: RouterId, prefix: Prefix },
+    Remove { dest: RouterId },
 }
 
 /// Maximum number of distinct destinations the engine will intern from untrusted wire input.
@@ -57,6 +64,8 @@ pub struct Daemon<T: Transport> {
     rib_tx: watch::Sender<RibSnapshot>,
     /// FIB reconciler; None when `--no-fib` is set or netlink connect failed.
     fib: Option<FibReconciler>,
+    local_origin_rx: mpsc::UnboundedReceiver<LocalOriginCommand>,
+    local_origin_closed: bool,
 }
 
 impl<T: Transport> Daemon<T> {
@@ -65,8 +74,22 @@ impl<T: Transport> Daemon<T> {
     /// The receiver stays live as long as the sender (held by the daemon) is alive,
     /// so it is valid across the `run` call even though `run` consumes `self`.
     pub fn new(cfg: DaemonConfig, transport: T) -> (Self, watch::Receiver<RibSnapshot>) {
+        let (daemon, rib_rx, _origin_tx) = Self::new_controlled(cfg, transport);
+        (daemon, rib_rx)
+    }
+
+    /// Create a new daemon and return a command sender for dynamic local origins.
+    pub fn new_controlled(
+        cfg: DaemonConfig,
+        transport: T,
+    ) -> (
+        Self,
+        watch::Receiver<RibSnapshot>,
+        mpsc::UnboundedSender<LocalOriginCommand>,
+    ) {
         let engine = Engine::new(cfg.router_id.clone(), cfg.prefix, cfg.cfg, cfg.policy);
         let (rib_tx, rib_rx) = watch::channel(RibSnapshot::default());
+        let (local_origin_tx, local_origin_rx) = mpsc::unbounded_channel();
         // Pre-seed the prefix_to_rid with our own router-id.
         let mut prefix_to_rid = HashMap::new();
         prefix_to_rid.insert(cfg.prefix, cfg.router_id.clone());
@@ -82,8 +105,10 @@ impl<T: Transport> Daemon<T> {
             next_nid: 0,
             rib_tx,
             fib: None,
+            local_origin_rx,
+            local_origin_closed: false,
         };
-        (daemon, rib_rx)
+        (daemon, rib_rx, local_origin_tx)
     }
 
     /// Current monotonic time fed to the engine.
@@ -113,14 +138,13 @@ impl<T: Transport> Daemon<T> {
                 let src_ip = *inb.src.ip();
                 let nid = self.resolve_neighbor(inb.iface, src_ip);
 
-                // Learn prefix → RouterId mapping from the `from` field + self-pin entry.
-                // The self-pin entry has dest == msg.from; register it so snapshot can look up.
+                // Learn prefix → RouterId mapping from every advertised entry. The
+                // primary self-pin has dest == msg.from; dynamic local origins use
+                // their own destination ids.
                 for entry in &msg.delta {
-                    if entry.dest == msg.from {
-                        self.prefix_to_rid
-                            .entry(entry.prefix)
-                            .or_insert_with(|| msg.from.clone());
-                    }
+                    self.prefix_to_rid
+                        .entry(entry.prefix)
+                        .or_insert_with(|| entry.dest.clone());
                 }
 
                 // CAP: guard against dest table explosion from untrusted input.
@@ -171,6 +195,27 @@ impl<T: Transport> Daemon<T> {
             });
         }
         intents
+    }
+
+    fn handle_local_origin_command(&mut self, cmd: LocalOriginCommand) {
+        match cmd {
+            LocalOriginCommand::Add { dest, prefix } => {
+                self.engine.add_local_origin(dest.clone(), prefix);
+                self.prefix_to_rid.insert(prefix, dest.clone());
+                tracing::info!(
+                    dest = %dest.0,
+                    prefix = %format!("{}/{}", prefix.addr, prefix.len),
+                    "local origin added"
+                );
+            }
+            LocalOriginCommand::Remove { dest } => {
+                if self.engine.remove_local_origin(&dest) {
+                    tracing::info!(dest = %dest.0, "local origin removed");
+                } else {
+                    tracing::debug!(dest = %dest.0, "local origin remove ignored");
+                }
+            }
+        }
     }
 
     /// Build a RIB snapshot from the engine's current desired_routes.
@@ -241,6 +286,12 @@ impl<T: Transport> Daemon<T> {
                         }
                     }
                 }
+                cmd = self.local_origin_rx.recv(), if !self.local_origin_closed => {
+                    match cmd {
+                        Some(cmd) => self.handle_local_origin_command(cmd),
+                        None => self.local_origin_closed = true,
+                    }
+                }
                 _ = &mut shutdown => {
                     tracing::info!("shutdown requested");
                     break;
@@ -279,6 +330,7 @@ mod tests {
             cfg,
             policy: ForwardingPolicy::default(),
             no_fib: true, // tests run without kernel netlink
+            control_socket: None,
         }
     }
 

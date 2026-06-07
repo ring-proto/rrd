@@ -6,7 +6,7 @@
 
 use ring_core::{Config, ForwardingPolicy, Prefix, RouterId};
 use rrd::config::DaemonConfig;
-use rrd::runtime::{Daemon, RibSnapshot};
+use rrd::runtime::{Daemon, LocalOriginCommand, RibSnapshot};
 use rrd::transport::MemBus;
 use std::net::Ipv6Addr;
 use std::time::Duration;
@@ -25,6 +25,7 @@ fn make_config(id: &str, prefix_addr: Ipv6Addr, tick_ms: u64) -> DaemonConfig {
         cfg,
         policy: ForwardingPolicy::default(),
         no_fib: true, // in-process tests run without kernel netlink
+        control_socket: None,
     }
 }
 
@@ -33,6 +34,50 @@ fn all_routable(snap: &RibSnapshot, expected: &[&str]) -> bool {
     expected
         .iter()
         .all(|id| snap.routable.iter().any(|(rid, _)| rid.0 == *id))
+}
+
+async fn wait_until_routable(
+    rx: &watch::Receiver<RibSnapshot>,
+    router_id: &str,
+    timeout: Duration,
+) -> bool {
+    tokio::time::timeout(timeout, async {
+        loop {
+            if rx
+                .borrow()
+                .routable
+                .iter()
+                .any(|(rid, _)| rid.0 == router_id)
+            {
+                return true;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap_or(false)
+}
+
+async fn wait_until_not_routable(
+    rx: &watch::Receiver<RibSnapshot>,
+    router_id: &str,
+    timeout: Duration,
+) -> bool {
+    tokio::time::timeout(timeout, async {
+        loop {
+            if !rx
+                .borrow()
+                .routable
+                .iter()
+                .any(|(rid, _)| rid.0 == router_id)
+            {
+                return true;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap_or(false)
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -130,5 +175,59 @@ async fn three_daemons_converge() {
         s2.routable.len(),
         2,
         "n2 should have exactly 2 routable dests"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn dynamic_local_origin_diffuses_and_withdraws() {
+    let tick_ms = 15u64;
+    let n = 3;
+    let mut transports = MemBus::fully_connected(n);
+    let ids = ["n0", "n1", "n2"];
+    let prefixes: Vec<Ipv6Addr> = (0..n as u16)
+        .map(|i| Ipv6Addr::new(0xfd00, 0, i, 0, 0, 0, 0, 0))
+        .collect();
+
+    let mut receivers: Vec<watch::Receiver<RibSnapshot>> = Vec::new();
+    let mut origin_controls = Vec::new();
+    for i in 0..n {
+        let t = transports.remove(0);
+        let cfg = make_config(ids[i], prefixes[i], tick_ms);
+        let (daemon, rx, origin_tx) = Daemon::new_controlled(cfg, t);
+        receivers.push(rx);
+        origin_controls.push(origin_tx);
+        tokio::spawn(async move {
+            daemon.run(std::future::pending::<()>()).await;
+        });
+    }
+
+    assert!(
+        wait_until_routable(&receivers[0], "n2", Duration::from_secs(5)).await,
+        "base topology should converge before injecting dynamic origins"
+    );
+
+    let pod_id = RouterId("pod:default/demo".to_string());
+    origin_controls[2]
+        .send(LocalOriginCommand::Add {
+            dest: pod_id.clone(),
+            prefix: Prefix {
+                addr: "fd00:ffff::1".parse().unwrap(),
+                len: 128,
+            },
+        })
+        .unwrap();
+
+    assert!(
+        wait_until_routable(&receivers[0], &pod_id.0, Duration::from_secs(5)).await,
+        "ring0 should learn ring2's dynamic local origin"
+    );
+
+    origin_controls[2]
+        .send(LocalOriginCommand::Remove { dest: pod_id.clone() })
+        .unwrap();
+
+    assert!(
+        wait_until_not_routable(&receivers[0], &pod_id.0, Duration::from_secs(5)).await,
+        "ring0 should withdraw the dynamic origin after it is removed"
     );
 }

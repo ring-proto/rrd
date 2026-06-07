@@ -54,6 +54,9 @@ DST2="fd00:a2::1"       # ring2's host address (2 hops from ring0)
 DST2_PFX="fd00:a2::/64" # ring2's prefix (what ring0 must install)
 RING0_LEARNS="$DST2_PFX"
 RING2_LEARNS="fd00:a0::/64"
+DYN_DEST="pod:default/demo"
+DYN_ADDR="fd00:ffff::1"
+DYN_PFX="${DYN_ADDR}/128"
 
 # ── Stage 1: build (OUTSIDE the namespace, as the invoking user) ─────────────
 # Done before the re-exec so the user's cargo/rustup toolchain is used directly
@@ -108,7 +111,18 @@ trap cleanup EXIT
 # has_route <node> <prefix> : succeed if `ip -6 route show proto 155` on the
 # node contains the prefix.
 has_route() {
-    nsx "$1" ip -6 route show proto 155 2>/dev/null | grep -q "$2"
+    local routes needle alt
+    routes="$(nsx "$1" ip -6 route show proto 155 2>/dev/null)"
+    needle="$2"
+    if echo "$routes" | grep -q "$needle"; then
+        return 0
+    fi
+    # iproute2 prints IPv6 /128 host routes as the bare address (no /128 suffix).
+    if [[ "$needle" == */128 ]]; then
+        alt="${needle%/128}"
+        echo "$routes" | grep -q "$alt" && return 0
+    fi
+    return 1
 }
 
 # wait_route <node> <prefix> <timeout_s> : poll until the route appears.
@@ -179,6 +193,36 @@ if ping_ok 0 "$DST2"; then
 else
     fail "2-hop ping did not deliver"
     CORE_OK=0
+fi
+
+note "ASSERT 2b — dynamic local origin add/remove diffuses through RRD"
+nsx 2 ip -6 addr add "$DYN_PFX" dev dum0
+if lab_control_origin 2 add "$DYN_DEST" "$DYN_PFX" \
+   && wait_route 0 "$DYN_PFX" "$CONVERGE_TIMEOUT"; then
+    pass "ring0 installed dynamic origin route to $DYN_PFX"
+else
+    fail "dynamic origin route to $DYN_PFX did not install"
+fi
+echo "--- ring0: dynamic-origin routes ---"
+lab_route_table 0
+echo "--- dynamic-origin ping ring0 -> $DYN_ADDR ---"
+if ping_ok 0 "$DYN_ADDR"; then
+    pass "dynamic /128 ping delivered through RRD"
+else
+    fail "dynamic /128 ping did not deliver"
+fi
+if lab_control_origin 2 remove "$DYN_DEST" \
+   && wait_no_route 0 "$DYN_PFX" "$SEVER_WAIT"; then
+    pass "ring0 withdrew dynamic origin route to $DYN_PFX"
+else
+    fail "dynamic origin route to $DYN_PFX did not withdraw"
+fi
+nsx 2 ip -6 addr del "$DYN_PFX" dev dum0 2>/dev/null || true
+echo "--- post-dynamic-remove ping (expected to FAIL) ---"
+if ping_ok 0 "$DYN_ADDR"; then
+    fail "dynamic ping still delivers after origin removal"
+else
+    pass "dynamic ping fails after origin removal"
 fi
 
 note "ASSERT 3 — cut ring1—ring2 severs the route"

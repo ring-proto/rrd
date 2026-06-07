@@ -187,6 +187,7 @@ lab_up() {
             --prefix "fd00:a${i}::/64" \
             "${ifargs[@]}" \
             --tick-ms "$TICK_MS" \
+            --control-socket "${LOG_DIR}/n${i}.sock" \
             >"${LOG_DIR}/n${i}.log" 2>&1 &
         RRD_PID[$i]=$!
     done
@@ -226,6 +227,43 @@ lab_wait_lladdr() {
 lab_route_table() {
     local i="${1:?node index required}"
     nsx "$i" ip -6 route show | grep -E 'proto (ring|155)' || true
+}
+
+# lab_control_origin <node> <add|remove> <dest> [prefix]
+# Send a JSON control request to one daemon's Unix socket. The socket lives in
+# the shared lab mount namespace; only the daemon's network namespace differs.
+lab_control_origin() {
+    local i="${1:?node index required}"; local op="${2:?op required}"; local dest="${3:?dest required}"
+    local prefix="${4:-}"
+    local sock="${LOG_DIR}/n${i}.sock"
+    python3 - "$sock" "$op" "$dest" "$prefix" <<'PY'
+import json, socket, sys, time
+
+sock_path, op, dest, prefix = sys.argv[1:5]
+if op == "add":
+    payload = {"type": "add_local_origin", "dest": dest, "prefix": prefix}
+elif op == "remove":
+    payload = {"type": "remove_local_origin", "dest": dest}
+else:
+    raise SystemExit(f"unknown op: {op}")
+
+last = None
+for _ in range(100):
+    try:
+        s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        s.connect(sock_path)
+        s.sendall((json.dumps(payload) + "\n").encode())
+        response = s.recv(4096).decode().strip()
+        s.close()
+        data = json.loads(response)
+        if data.get("type") == "ok":
+            raise SystemExit(0)
+        raise SystemExit(f"control error: {response}")
+    except (FileNotFoundError, ConnectionRefusedError) as exc:
+        last = exc
+        time.sleep(0.05)
+raise SystemExit(f"control socket unavailable: {last}")
+PY
 }
 
 # ── lab_link_set <i> <j> <up|down> ───────────────────────────────────────────

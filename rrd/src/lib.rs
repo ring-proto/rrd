@@ -1,4 +1,5 @@
 pub mod config;
+pub mod control;
 pub mod fib;
 pub mod runtime;
 pub mod transport;

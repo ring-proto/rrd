@@ -18,15 +18,14 @@ struct Peer {
 
 pub struct Engine {
     id: RouterId,
-    prefix: Prefix,
     cfg: Config,
     policy: ForwardingPolicy,
+    local_origins: HashMap<RouterId, Prefix>,
 
     // local destination index (never crosses the wire)
     dest_slot: HashMap<RouterId, usize>,
     dest_key: Vec<RouterId>,
     dest_prefix: Vec<Prefix>,
-    self_slot: usize,
 
     // per-destination dense state
     f: Vec<f64>,
@@ -50,13 +49,12 @@ impl Engine {
     pub fn new(id: RouterId, prefix: Prefix, cfg: Config, policy: ForwardingPolicy) -> Self {
         let mut e = Engine {
             id: id.clone(),
-            prefix,
             cfg,
             policy,
+            local_origins: HashMap::from([(id.clone(), prefix)]),
             dest_slot: HashMap::new(),
             dest_key: Vec::new(),
             dest_prefix: Vec::new(),
-            self_slot: 0,
             f: Vec::new(),
             vit: Vec::new(),
             dominant: Vec::new(),
@@ -69,8 +67,36 @@ impl Engine {
             stress: 0.0,
             fbuf: Vec::new(),
         };
-        e.self_slot = e.intern_dest(id, prefix);
+        e.intern_dest(id, prefix);
         e
+    }
+
+    /// Add or update a destination originated by this node.
+    ///
+    /// Local origins are advertised at the source self-pin (`f0`, `vit=1`) on
+    /// every step and are suppressed from this node's own desired FIB routes.
+    /// The primary router-id/prefix created by [`Engine::new`] is just the
+    /// first local origin; CNI/pod/service ownership can add more dynamically.
+    pub fn add_local_origin(&mut self, dest: RouterId, prefix: Prefix) -> bool {
+        let is_new = !self.local_origins.contains_key(&dest);
+        let slot = self.intern_dest(dest.clone(), prefix);
+        self.dest_prefix[slot] = prefix;
+        self.local_origins.insert(dest, prefix);
+        is_new
+    }
+
+    /// Stop originating a dynamic local destination.
+    ///
+    /// Returns false for the primary router-id (which remains permanently
+    /// local) or for an unknown/non-local destination. Removing a local origin
+    /// only stops the self-pin; any stale remote evidence then fades through
+    /// normal vitality/conductance aging rather than becoming a correctness
+    /// gate.
+    pub fn remove_local_origin(&mut self, dest: &RouterId) -> bool {
+        if *dest == self.id {
+            return false;
+        }
+        self.local_origins.remove(dest).is_some()
     }
 
     pub fn add_neighbor(&mut self, n: NeighborId) {
@@ -222,12 +248,16 @@ impl Engine {
 
         let ndest = self.ndest();
         let mut delta: Vec<Entry> = Vec::with_capacity(ndest);
-        delta.push(Entry {
-            dest: self.id.clone(),
-            prefix: self.prefix,
-            pot: self.cfg.f0,
-            vit: 1.0,
-        });
+        let mut local_origins: Vec<_> = self.local_origins.iter().collect();
+        local_origins.sort_by(|(a, _), (b, _)| a.0.cmp(&b.0));
+        for (dest, prefix) in local_origins {
+            delta.push(Entry {
+                dest: dest.clone(),
+                prefix: *prefix,
+                pot: self.cfg.f0,
+                vit: 1.0,
+            });
+        }
         let mut carried = 0.0;
 
         if gsum > 0.0 {
@@ -243,7 +273,7 @@ impl Engine {
                 }
             }
             for d in 0..ndest {
-                if d == self.self_slot {
+                if self.local_origins.contains_key(&self.dest_key[d]) {
                     self.f[d] = 0.0;
                     self.dominant[d] = None;
                     self.hops[d].clear();
@@ -302,7 +332,7 @@ impl Engine {
     pub fn desired_routes(&self, now: Mono) -> impl Iterator<Item = DesiredRoute> + '_ {
         let drift = ticks_between(self.last_aged, now, self.cfg.tick);
         (0..self.ndest()).filter_map(move |d| {
-            if d == self.self_slot {
+            if self.local_origins.contains_key(&self.dest_key[d]) {
                 return None;
             }
             let known = self.f[d] >= self.cfg.floor && self.dominant[d].is_some();
@@ -400,6 +430,48 @@ mod tests {
         assert_eq!(pin.dest, RouterId::from("a"));
         assert_eq!(pin.pot, cfg.f0);
         assert_eq!(pin.vit, 1.0);
+    }
+
+    #[test]
+    fn dynamic_local_origin_is_advertised_as_self_pin_and_not_installed_locally() {
+        let cfg = Config::default();
+        let mut e = Engine::new(RouterId::from("a"), px(1), cfg, Default::default());
+        let dyn_dest = RouterId::from("pod:default/demo");
+
+        assert!(e.add_local_origin(dyn_dest.clone(), px(99)));
+
+        let out = e.step(Duration::ZERO);
+        let dyn_pin = out
+            .emit
+            .delta
+            .iter()
+            .find(|entry| entry.dest == dyn_dest)
+            .expect("dynamic local origin should be emitted");
+        assert_eq!(dyn_pin.prefix, px(99));
+        assert_eq!(dyn_pin.pot, cfg.f0);
+        assert_eq!(dyn_pin.vit, 1.0);
+
+        assert!(
+            e.desired_routes(Duration::ZERO)
+                .all(|route| route.prefix != px(99)),
+            "a node must never install a route to its own local origin"
+        );
+    }
+
+    #[test]
+    fn removed_dynamic_local_origin_stops_being_advertised() {
+        let cfg = Config::default();
+        let mut e = Engine::new(RouterId::from("a"), px(1), cfg, Default::default());
+        let dyn_dest = RouterId::from("pod:default/demo");
+        e.add_local_origin(dyn_dest.clone(), px(99));
+
+        assert!(e.remove_local_origin(&dyn_dest));
+
+        let out = e.step(Duration::ZERO);
+        assert!(
+            out.emit.delta.iter().all(|entry| entry.dest != dyn_dest),
+            "removed local origin must not remain pinned in outbound deltas"
+        );
     }
 
     #[test]

@@ -6,6 +6,7 @@
 use clap::Parser;
 use ring_core::{Config, ForwardingPolicy, Prefix, RouterId};
 use std::net::Ipv6Addr;
+use std::path::PathBuf;
 use std::time::Duration;
 
 /// Parse a `addr/len` IPv6 prefix string into a [`Prefix`].
@@ -78,6 +79,10 @@ pub struct Cli {
     /// Disable kernel FIB installation (control-plane only).
     #[arg(long, default_value_t = false)]
     pub no_fib: bool,
+
+    /// Optional Unix control socket for adding/removing dynamic local origins.
+    #[arg(long)]
+    pub control_socket: Option<String>,
 }
 
 /// Fully resolved daemon configuration, ready for use by the runtime.
@@ -91,6 +96,7 @@ pub struct DaemonConfig {
     pub policy: ForwardingPolicy,
     /// When true, skip kernel FIB installation (control-plane only).
     pub no_fib: bool,
+    pub control_socket: Option<PathBuf>,
 }
 
 impl DaemonConfig {
@@ -126,6 +132,7 @@ impl DaemonConfig {
             cfg,
             policy: ForwardingPolicy::default(),
             no_fib: cli.no_fib,
+            control_socket: cli.control_socket.as_ref().map(PathBuf::from),
         })
     }
 }
@@ -184,6 +191,8 @@ mod tests {
             "50",
             "--kappa",
             "0.1",
+            "--control-socket",
+            "/tmp/rrd.sock",
         ];
         let cli = Cli::try_parse_from(args).expect("should parse");
         assert_eq!(cli.router_id, "test-node");
@@ -191,6 +200,7 @@ mod tests {
         assert_eq!(cli.kappa, Some(0.1));
         assert_eq!(cli.prefix, "fd00:0:1::/64");
         assert_eq!(cli.ifaces, vec!["lo"]);
+        assert_eq!(cli.control_socket.as_deref(), Some("/tmp/rrd.sock"));
     }
 
     #[test]
@@ -204,6 +214,7 @@ mod tests {
             alpha: None,
             phi: None,
             no_fib: false,
+            control_socket: None,
         };
         let dc = DaemonConfig::from_cli(&cli).expect("should build");
         assert_eq!(dc.router_id.0, "mynode");
