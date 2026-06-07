@@ -222,7 +222,7 @@ lab_wait_lladdr() {
 # Show this node's proto-ring routes.
 lab_route_table() {
     local i="${1:?node index required}"
-    nsx "$i" ip -6 route show proto ring
+    nsx "$i" ip -6 route show proto 155
 }
 
 # ── lab_link_set <i> <j> <up|down> ───────────────────────────────────────────
