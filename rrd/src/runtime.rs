@@ -13,7 +13,7 @@
 //!   the receiver before `run` consumes `self`.
 
 use crate::config::DaemonConfig;
-use crate::fib::{FibReconciler, RouteIntent};
+use crate::fib::{ecmp_weights, FibReconciler, NextHop, RouteIntent};
 use crate::transport::{Inbound, Transport};
 use crate::wire;
 use ring_core::{Engine, Mono, NeighborId, Prefix, RouterId};
@@ -169,9 +169,13 @@ impl<T: Transport> Daemon<T> {
 
     /// Build the list of FIB route intents from the engine's desired routes.
     ///
-    /// For each routable `DesiredRoute`, resolve the dominant next-hop
-    /// `NeighborId` to its `(oif, fe80::)` locator via `addr_by_neighbor`.
-    /// Entries whose nexthop is unknown are silently skipped.
+    /// For each routable `DesiredRoute`, resolve every weighted next-hop
+    /// `NeighborId` to its `(oif, fe80::)` locator via `addr_by_neighbor` and
+    /// map the engine's float current-split weights to kernel ECMP weights. A
+    /// single resolved hop yields an ordinary gateway route; multiple hops yield
+    /// a multipath route, so the field's load split reaches the dataplane.
+    /// Hops whose locator is unknown are skipped; a route with no resolvable
+    /// hops is dropped entirely.
     fn build_route_intents(&self) -> Vec<RouteIntent> {
         let now = self.now();
         let mut intents = Vec::new();
@@ -179,19 +183,32 @@ impl<T: Transport> Daemon<T> {
             if !dr.routable {
                 continue;
             }
-            // Take the dominant (first) nexthop.
-            let nid = match dr.nexthops.first() {
-                Some(hop) => hop.via,
-                None => continue,
-            };
-            let (oif, gateway) = match self.addr_by_neighbor.get(&nid) {
-                Some(&loc) => loc,
-                None => continue,
-            };
+            // Resolve hops to locators, preserving the engine's descending-weight
+            // order and keeping the float weights for proportional ECMP mapping.
+            let mut locators = Vec::new();
+            let mut weights = Vec::new();
+            for hop in &dr.nexthops {
+                if let Some(&(oif, gateway)) = self.addr_by_neighbor.get(&hop.via) {
+                    locators.push((gateway, oif));
+                    weights.push(hop.weight);
+                }
+            }
+            if locators.is_empty() {
+                continue;
+            }
+            let ecmp = ecmp_weights(&weights);
+            let nexthops: Vec<NextHop> = locators
+                .into_iter()
+                .zip(ecmp)
+                .map(|((gateway, oif), weight)| NextHop {
+                    gateway,
+                    oif,
+                    weight,
+                })
+                .collect();
             intents.push(RouteIntent {
                 prefix: dr.prefix,
-                gateway,
-                oif,
+                nexthops,
             });
         }
         intents

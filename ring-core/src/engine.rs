@@ -661,6 +661,50 @@ mod tests {
     }
 
     #[test]
+    fn desired_routes_installs_multipath_when_policy_allows() {
+        let cfg = Config::default();
+        let policy = ForwardingPolicy {
+            max_paths: 4,
+            ..ForwardingPolicy::default()
+        };
+        let mut a = Engine::new(RouterId::from("a"), px(1), cfg, policy);
+        a.add_neighbor(NeighborId(1));
+        a.add_neighbor(NeighborId(2));
+        // Two equal-conductance neighbours both advertise the same potential
+        // toward d, so the field retains BOTH as uphill hops.
+        let mk = |from: &str| Message {
+            from: RouterId::from(from),
+            hears: vec![RouterId::from("a")],
+            delta: vec![Entry {
+                dest: RouterId::from("d"),
+                prefix: px(9),
+                pot: 0.9,
+                vit: 1.0,
+            }],
+        };
+        for k in 0..3u32 {
+            let now = cfg.tick * k;
+            a.ingest(now, NeighborId(1), &mk("n1"));
+            a.ingest(now, NeighborId(2), &mk("n2"));
+            a.step(now);
+        }
+        let routes: Vec<_> = a.desired_routes(cfg.tick * 3).collect();
+        let d = routes
+            .iter()
+            .find(|r| r.prefix == px(9))
+            .expect("d present");
+        assert!(d.routable);
+        assert_eq!(
+            d.nexthops.len(),
+            2,
+            "both uphill hops must reach the dataplane when max_paths >= 2"
+        );
+        // Weights are the engine's current split, descending.
+        assert!(d.nexthops[0].weight >= d.nexthops[1].weight);
+        assert!(d.nexthops.iter().all(|h| h.weight > 0.0));
+    }
+
+    #[test]
     fn gate_closes_when_vitality_decays_below_phi() {
         let cfg = Config::default();
         let mut a = Engine::new(RouterId::from("a"), px(1), cfg, Default::default());

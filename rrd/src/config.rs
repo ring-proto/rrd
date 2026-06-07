@@ -80,6 +80,11 @@ pub struct Cli {
     #[arg(long, default_value_t = false)]
     pub no_fib: bool,
 
+    /// Maximum number of weighted next-hops to install per destination. Values
+    /// above 1 install kernel IPv6 ECMP routes carrying the field's load split.
+    #[arg(long, default_value_t = 8)]
+    pub max_paths: usize,
+
     /// Optional Unix control socket for adding/removing dynamic local origins.
     #[arg(long)]
     pub control_socket: Option<String>,
@@ -130,7 +135,10 @@ impl DaemonConfig {
             prefix,
             ifaces,
             cfg,
-            policy: ForwardingPolicy::default(),
+            policy: ForwardingPolicy {
+                max_paths: cli.max_paths.max(1),
+                ..ForwardingPolicy::default()
+            },
             no_fib: cli.no_fib,
             control_socket: cli.control_socket.as_ref().map(PathBuf::from),
         })
@@ -214,11 +222,31 @@ mod tests {
             alpha: None,
             phi: None,
             no_fib: false,
+            max_paths: 4,
             control_socket: None,
         };
         let dc = DaemonConfig::from_cli(&cli).expect("should build");
         assert_eq!(dc.router_id.0, "mynode");
         assert_eq!(dc.cfg.tick, Duration::from_millis(200));
         assert!((dc.cfg.kappa - 0.2).abs() < 1e-12);
+        assert_eq!(dc.policy.max_paths, 4);
+    }
+
+    #[test]
+    fn max_paths_is_floored_to_one() {
+        let cli = Cli {
+            router_id: "mynode".to_string(),
+            prefix: "fd00::1/64".to_string(),
+            ifaces: vec![],
+            tick_ms: 100,
+            kappa: None,
+            alpha: None,
+            phi: None,
+            no_fib: true,
+            max_paths: 0,
+            control_socket: None,
+        };
+        let dc = DaemonConfig::from_cli(&cli).expect("should build");
+        assert_eq!(dc.policy.max_paths, 1, "max_paths must never be zero");
     }
 }

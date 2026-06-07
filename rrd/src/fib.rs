@@ -15,24 +15,67 @@
 //! A failed netlink operation is logged at `warn` level and is retried on the
 //! next reconcile tick.  A single failure never aborts the daemon.
 
-use netlink_packet_route::route::RouteProtocol;
+use netlink_packet_route::route::{RouteNextHop, RouteProtocol};
 use ring_core::Prefix;
-use rtnetlink::{Handle, RouteMessageBuilder};
+use rtnetlink::{Handle, RouteMessageBuilder, RouteNextHopBuilder};
 use std::collections::HashMap;
 use std::io;
-use std::net::Ipv6Addr;
+use std::net::{IpAddr, Ipv6Addr};
 
 /// RTPROT value for RING daemon routes (unreserved user-space range).
 pub const RING_PROTO: u8 = 155;
 
-/// One concrete route the FIB should contain.
+/// One weighted next-hop within a (possibly multipath) route.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct RouteIntent {
-    pub prefix: Prefix,
+pub struct NextHop {
     /// Link-local next-hop address (fe80::…).
     pub gateway: Ipv6Addr,
     /// Output interface index.
     pub oif: u32,
+    /// Kernel ECMP weight encoding (`rtnh_hops`); the effective weight the
+    /// kernel uses is `weight + 1`, so `0` is the minimum share, `255` the max.
+    pub weight: u8,
+}
+
+/// One concrete route the FIB should contain.
+///
+/// A route carries one or more weighted next-hops. A single next-hop installs
+/// as an ordinary gateway route; multiple next-hops install as a kernel IPv6
+/// ECMP (`RTA_MULTIPATH`) route, projecting the engine's weighted uphill set
+/// directly into the dataplane.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RouteIntent {
+    pub prefix: Prefix,
+    /// Non-empty, deterministically ordered (descending weight) next-hop set.
+    pub nexthops: Vec<NextHop>,
+}
+
+/// Map the engine's float current-split weights (`g·(pot−f)`, descending and
+/// strictly positive) to kernel ECMP weight encodings in `0..=255`.
+///
+/// The dominant hop maps to `255` (effective weight 256) and the rest scale
+/// proportionally, preserving the field's load-split ratios. This is a pure
+/// function so the proportional mapping is unit-testable without a live kernel.
+/// Non-finite or non-positive inputs collapse to `0` (the minimum share).
+pub fn ecmp_weights(weights: &[f64]) -> Vec<u8> {
+    let wmax = weights
+        .iter()
+        .copied()
+        .filter(|w| w.is_finite() && *w > 0.0)
+        .fold(0.0_f64, f64::max);
+    if wmax <= 0.0 {
+        return vec![0u8; weights.len()];
+    }
+    weights
+        .iter()
+        .map(|&w| {
+            if !w.is_finite() || w <= 0.0 {
+                return 0u8;
+            }
+            let scaled = (w / wmax * 255.0).round();
+            scaled.clamp(0.0, 255.0) as u8
+        })
+        .collect()
 }
 
 /// Maintains a diff between the desired set of routes and what is currently
@@ -74,11 +117,10 @@ impl FibReconciler {
             };
             if needs_install {
                 tracing::info!(
-                    "fib: install {}/{} via {} dev {}",
+                    "fib: install {}/{} via {} nexthop(s)",
                     prefix.addr,
                     prefix.len,
-                    intent.gateway,
-                    intent.oif,
+                    intent.nexthops.len(),
                 );
                 match self.install_route(intent).await {
                     Ok(()) => {
@@ -153,13 +195,37 @@ impl FibReconciler {
     }
 
     /// Build and send an RTM_NEWROUTE (with NLM_F_REPLACE) for the intent.
+    ///
+    /// A single next-hop installs as an ordinary gateway route. Two or more
+    /// next-hops install as a kernel IPv6 ECMP route via `RTA_MULTIPATH`,
+    /// carrying the per-hop weights derived from the engine's current split.
     async fn install_route(&self, intent: &RouteIntent) -> Result<(), rtnetlink::Error> {
-        let msg = RouteMessageBuilder::<Ipv6Addr>::new()
-            .destination_prefix(intent.prefix.addr, intent.prefix.len)
-            .gateway(intent.gateway)
-            .output_interface(intent.oif)
-            .protocol(self.proto)
-            .build();
+        let msg = match intent.nexthops.as_slice() {
+            [single] => RouteMessageBuilder::<Ipv6Addr>::new()
+                .destination_prefix(intent.prefix.addr, intent.prefix.len)
+                .gateway(single.gateway)
+                .output_interface(single.oif)
+                .protocol(self.proto)
+                .build(),
+            hops => {
+                let nexthops: Vec<RouteNextHop> = hops
+                    .iter()
+                    .map(|hop| {
+                        RouteNextHopBuilder::new_ipv6()
+                            .interface(hop.oif)
+                            .via(IpAddr::V6(hop.gateway))
+                            .expect("ipv6 gateway on an ipv6 nexthop is always valid")
+                            .weight(hop.weight)
+                            .build()
+                    })
+                    .collect();
+                RouteMessageBuilder::<Ipv6Addr>::new()
+                    .destination_prefix(intent.prefix.addr, intent.prefix.len)
+                    .protocol(self.proto)
+                    .multipath(nexthops)
+                    .build()
+            }
+        };
         self.handle
             .route()
             .add(msg)
@@ -195,5 +261,41 @@ fn is_already_gone(err: &rtnetlink::Error) -> bool {
             || errno == nix::errno::Errno::ENOENT as i32;
     }
     false
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn ecmp_weights_map_dominant_to_max_and_scale_proportionally() {
+        // A 2:1 current split should map to a 2:1 kernel weight ratio, with the
+        // dominant hop pinned at the 255 ceiling.
+        let w = ecmp_weights(&[1.0, 0.5]);
+        assert_eq!(w, vec![255, 128]);
+    }
+
+    #[test]
+    fn ecmp_weights_single_hop_is_max() {
+        assert_eq!(ecmp_weights(&[0.42]), vec![255]);
+    }
+
+    #[test]
+    fn ecmp_weights_equal_split_is_equal_weight() {
+        assert_eq!(ecmp_weights(&[0.7, 0.7, 0.7]), vec![255, 255, 255]);
+    }
+
+    #[test]
+    fn ecmp_weights_collapse_nonpositive_and_nonfinite_to_zero() {
+        let w = ecmp_weights(&[1.0, 0.0, -3.0, f64::NAN, f64::INFINITY]);
+        // 1.0 is the only valid weight → it is the max → 255; the rest floor to 0.
+        assert_eq!(w, vec![255, 0, 0, 0, 0]);
+    }
+
+    #[test]
+    fn ecmp_weights_all_invalid_returns_all_zero() {
+        assert_eq!(ecmp_weights(&[0.0, -1.0]), vec![0, 0]);
+        assert_eq!(ecmp_weights(&[]), Vec::<u8>::new());
+    }
 }
 

@@ -11,7 +11,7 @@
 //!   sudo ip netns del fibtest
 
 use ring_core::Prefix;
-use rrd::fib::{FibReconciler, RouteIntent};
+use rrd::fib::{FibReconciler, NextHop, RouteIntent};
 use std::env;
 use std::net::Ipv6Addr;
 
@@ -37,7 +37,14 @@ async fn main() {
     };
     let gateway: Ipv6Addr = "fe80::1".parse().unwrap();
 
-    let intent = RouteIntent { prefix, gateway, oif };
+    let intent = RouteIntent {
+        prefix,
+        nexthops: vec![NextHop {
+            gateway,
+            oif,
+            weight: 255,
+        }],
+    };
 
     println!("fibcheck: reconciling fd00:5e57::/64 via fe80::1 dev {} ...", oif);
     fib.reconcile(&[intent]).await;
