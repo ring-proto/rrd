@@ -157,9 +157,9 @@ else
 fi
 
 note "ASSERT 1 — proto-ring routes installed"
-echo "--- ring0: ip -6 route show proto 155 ---"
+echo "--- ring0: RING-installed routes (proto ring / 155) ---"
 lab_route_table 0
-echo "--- ring2: ip -6 route show proto 155 ---"
+echo "--- ring2: RING-installed routes (proto ring / 155) ---"
 lab_route_table 2
 if has_route 0 "$RING0_LEARNS"; then
     pass "ring0 has proto-ring route to $RING0_LEARNS"

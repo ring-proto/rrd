@@ -219,10 +219,13 @@ lab_wait_lladdr() {
 }
 
 # ── lab_route_table <i> ──────────────────────────────────────────────────────
-# Show this node's proto-ring routes.
+# Show this node's RING-installed routes. We grep the UNFILTERED table (rather
+# than `show proto 155`) so the human-readable `proto ring` name appears when the
+# rt_protos mapping is installed (`make install-rtproto`); it falls back to the
+# numeric `proto 155` otherwise. Correctness checks elsewhere filter by the number.
 lab_route_table() {
     local i="${1:?node index required}"
-    nsx "$i" ip -6 route show proto 155
+    nsx "$i" ip -6 route show | grep -E 'proto (ring|155)' || true
 }
 
 # ── lab_link_set <i> <j> <up|down> ───────────────────────────────────────────
