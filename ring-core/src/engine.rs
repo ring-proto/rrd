@@ -97,7 +97,7 @@ impl Engine {
         }
         self.age_all(now);
         let transit = if self.cfg.no_retard { 0.0 } else { 1.0 };
-        let hears = msg.hears.iter().any(|r| *r == self.id);
+        let hears = msg.hears.contains(&self.id);
 
         for e in &msg.delta {
             if e.dest == self.id {

@@ -15,7 +15,7 @@
 //! A failed netlink operation is logged at `warn` level and is retried on the
 //! next reconcile tick.  A single failure never aborts the daemon.
 
-use netlink_packet_route::route::{RouteAttribute, RouteProtocol};
+use netlink_packet_route::route::RouteProtocol;
 use ring_core::Prefix;
 use rtnetlink::{Handle, RouteMessageBuilder};
 use std::collections::HashMap;
@@ -158,7 +158,7 @@ impl FibReconciler {
             .destination_prefix(intent.prefix.addr, intent.prefix.len)
             .gateway(intent.gateway)
             .output_interface(intent.oif)
-            .protocol(self.proto.clone())
+            .protocol(self.proto)
             .build();
         self.handle
             .route()
@@ -172,7 +172,7 @@ impl FibReconciler {
     async fn delete_route(&self, prefix: &Prefix) -> Result<(), rtnetlink::Error> {
         let msg = RouteMessageBuilder::<Ipv6Addr>::new()
             .destination_prefix(prefix.addr, prefix.len)
-            .protocol(self.proto.clone())
+            .protocol(self.proto)
             .build();
         self.handle
             .route()
@@ -197,10 +197,3 @@ fn is_already_gone(err: &rtnetlink::Error) -> bool {
     false
 }
 
-/// Remove the `RouteAttribute::Gateway` attribute from a `RouteMessage` and
-/// replace it with an `Oif` if the gateway happens to be unspecified.
-/// (Utility, currently unused — kept for future debugging.)
-#[allow(dead_code)]
-fn strip_gateway(attrs: &mut Vec<RouteAttribute>) {
-    attrs.retain(|a| !matches!(a, RouteAttribute::Gateway(_)));
-}

@@ -77,6 +77,7 @@ impl Fabric {
         let tick_nanos = cfg.tick.as_nanos() as i128;
 
         let mut nodes = Vec::with_capacity(n);
+        #[allow(clippy::needless_range_loop)] // `i` is used for format, prefix, link matching, and skew index
         for i in 0..n {
             let id = RouterId::from(format!("n{i}").as_str());
             let mut engine = Engine::new(id.clone(), node_prefix(i), cfg, ForwardingPolicy::default());

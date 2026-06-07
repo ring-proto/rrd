@@ -30,7 +30,6 @@ pub fn parse_prefix(s: &str) -> Result<Prefix, String> {
 /// Resolve an interface name to its ifindex using `nix::net::if_::if_nametoindex`.
 fn resolve_iface(name: &str) -> Result<u32, String> {
     nix::net::if_::if_nametoindex(name)
-        .map(|idx| idx as u32)
         .map_err(|e| format!("cannot resolve interface {:?}: {}", name, e))
 }
 
@@ -106,8 +105,7 @@ impl DaemonConfig {
             .map(|name| resolve_iface(name))
             .collect::<Result<Vec<_>, _>>()?;
 
-        let mut cfg = Config::default();
-        cfg.tick = Duration::from_millis(cli.tick_ms);
+        let mut cfg = Config { tick: Duration::from_millis(cli.tick_ms), ..Config::default() };
         if let Some(k) = cli.kappa {
             cfg.kappa = k;
         }

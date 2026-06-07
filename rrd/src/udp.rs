@@ -93,10 +93,7 @@ fn make_socket(ifindex: u32) -> io::Result<UdpSocket> {
     // constrains both RX and TX to that interface, so the ifindex tag is always
     // correct.  We resolve the ifindex to a name for SO_BINDTODEVICE.
     let ifname = nix::net::if_::if_indextoname(ifindex).map_err(|e| {
-        io::Error::new(
-            io::ErrorKind::Other,
-            format!("if_indextoname({}) failed: {}", ifindex, e),
-        )
+        io::Error::other(format!("if_indextoname({}) failed: {}", ifindex, e))
     })?;
     sock.bind_device(Some(ifname.as_bytes()))?;
 

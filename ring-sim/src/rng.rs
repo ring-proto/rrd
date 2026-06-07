@@ -28,6 +28,8 @@ impl Rng {
     /// True with probability `p`. `p <= 0` (or NaN) is never; `p >= 1` is always; neither draws
     /// from the stream, so callers can branch on a degenerate probability without perturbing the
     /// deterministic sequence.
+    // `!(p > 0.0)` is intentional: catches NaN (all NaN comparisons are false, so !(NaN > 0.0) == true).
+    #[allow(clippy::neg_cmp_op_on_partial_ord)]
     pub fn chance(&mut self, p: f64) -> bool {
         if !(p > 0.0) {
             return false; // p <= 0.0, or NaN (all NaN comparisons are false)

@@ -162,7 +162,7 @@ pub fn decode(buf: &[u8]) -> Result<Message, WireError> {
                 .try_into()
                 .unwrap(), // always 8 bytes
         );
-        if !vit.is_finite() || vit < 0.0 || vit > 1.0 {
+        if !vit.is_finite() || !(0.0..=1.0).contains(&vit) {
             return Err(WireError::BadValue(format!(
                 "vit {} is not in [0,1] or not finite",
                 vit

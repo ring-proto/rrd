@@ -2,7 +2,7 @@
 # harness/lab.sh — netns line-topology lab for rrd.
 #
 # Builds a line of N network namespaces ring0—ring1—…—ring(N-1) connected by
-# veth pairs, each node owning a ULA prefix fd00:ring:<i>::/64 (host address
+# veth pairs, each node owning a ULA prefix fd00:a<i>::/64 (host address
 # ::1 on a dummy interface dum0), with IPv6 forwarding enabled and an rrd
 # daemon launched in each namespace participating on its veth link(s).
 #
