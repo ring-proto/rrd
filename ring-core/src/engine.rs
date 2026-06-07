@@ -206,10 +206,13 @@ impl Engine {
     }
 
     /// Return the dense slot for `key`, allocating (and growing every dense vector, including
-    /// each neighbour's `pot`) if it is newly learned. Reach-ball GC (eviction when `f` drains
-    /// below the floor) is a later milestone; for now the index only grows.
+    /// each neighbour's `pot`) if it is newly learned. If the destination already exists, refresh
+    /// its advertised prefix: RouterId is the stable origin identity, while Prefix is mutable
+    /// routing metadata used by FIB projection. Reach-ball GC (eviction when `f` drains below the
+    /// floor) is a later milestone; for now the index only grows.
     fn intern_dest(&mut self, key: RouterId, prefix: Prefix) -> usize {
         if let Some(&s) = self.dest_slot.get(&key) {
+            self.dest_prefix[s] = prefix;
             return s;
         }
         let s = self.dest_key.len();

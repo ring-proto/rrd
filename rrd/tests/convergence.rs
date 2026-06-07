@@ -80,6 +80,29 @@ async fn wait_until_not_routable(
     .unwrap_or(false)
 }
 
+async fn wait_until_routable_with_prefix(
+    rx: &watch::Receiver<RibSnapshot>,
+    router_id: &str,
+    prefix: Prefix,
+    timeout: Duration,
+) -> bool {
+    tokio::time::timeout(timeout, async {
+        loop {
+            if rx
+                .borrow()
+                .routable
+                .iter()
+                .any(|(rid, p)| rid.0 == router_id && *p == prefix)
+            {
+                return true;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap_or(false)
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn three_daemons_converge() {
     let tick_ms = 15u64;
@@ -229,5 +252,75 @@ async fn dynamic_local_origin_diffuses_and_withdraws() {
     assert!(
         wait_until_not_routable(&receivers[0], &pod_id.0, Duration::from_secs(5)).await,
         "ring0 should withdraw the dynamic origin after it is removed"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn dynamic_local_origin_prefix_update_replaces_remote_route() {
+    let tick_ms = 15u64;
+    let n = 3;
+    let mut transports = MemBus::fully_connected(n);
+    let ids = ["n0", "n1", "n2"];
+    let prefixes: Vec<Ipv6Addr> = (0..n as u16)
+        .map(|i| Ipv6Addr::new(0xfd00, 0, i, 0, 0, 0, 0, 0))
+        .collect();
+
+    let mut receivers: Vec<watch::Receiver<RibSnapshot>> = Vec::new();
+    let mut origin_controls = Vec::new();
+    for i in 0..n {
+        let t = transports.remove(0);
+        let cfg = make_config(ids[i], prefixes[i], tick_ms);
+        let (daemon, rx, origin_tx) = Daemon::new_controlled(cfg, t);
+        receivers.push(rx);
+        origin_controls.push(origin_tx);
+        tokio::spawn(async move {
+            daemon.run(std::future::pending::<()>()).await;
+        });
+    }
+
+    assert!(
+        wait_until_routable(&receivers[0], "n2", Duration::from_secs(5)).await,
+        "base topology should converge before injecting dynamic origins"
+    );
+
+    let pod_id = RouterId("pod:default/demo".to_string());
+    let p1 = Prefix {
+        addr: "fd00:ffff::1".parse().unwrap(),
+        len: 128,
+    };
+    let p2 = Prefix {
+        addr: "fd00:ffff::2".parse().unwrap(),
+        len: 128,
+    };
+
+    origin_controls[2]
+        .send(LocalOriginCommand::Add {
+            dest: pod_id.clone(),
+            prefix: p1,
+        })
+        .unwrap();
+    assert!(
+        wait_until_routable_with_prefix(&receivers[0], &pod_id.0, p1, Duration::from_secs(5)).await,
+        "ring0 should learn the first prefix for the dynamic origin"
+    );
+
+    origin_controls[2]
+        .send(LocalOriginCommand::Add {
+            dest: pod_id.clone(),
+            prefix: p2,
+        })
+        .unwrap();
+
+    assert!(
+        wait_until_routable_with_prefix(&receivers[0], &pod_id.0, p2, Duration::from_secs(5)).await,
+        "ring0 should replace the old prefix when the same origin id is renumbered"
+    );
+    assert!(
+        receivers[0]
+            .borrow()
+            .routable
+            .iter()
+            .all(|(rid, p)| rid != &pod_id || *p != p1),
+        "the old prefix must not remain the active RIB route for the renumbered origin"
     );
 }
