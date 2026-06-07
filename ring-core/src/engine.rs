@@ -119,6 +119,20 @@ impl Engine {
         p.heard = now;
     }
 
+    /// Override a neighbour's link conductance `g` (bandwidth). Used to express per-link capacity;
+    /// defaults to `cfg.d` at `add_neighbor`.
+    pub fn set_neighbor_conductance(&mut self, n: NeighborId, g: f64) {
+        if let Some(p) = self.neighbors.get_mut(&n) {
+            p.g = g;
+        }
+    }
+
+    /// Test/inspection helper: the retained weighted uphill set toward `dest` (descending by
+    /// current-split weight). This is the full multipath set; the daemon installs a prefix of it.
+    pub fn peek_hops(&self, dest: &RouterId) -> Option<Vec<WeightedHop>> {
+        self.dest_slot.get(dest).map(|&d| self.hops[d].to_vec())
+    }
+
     /// Test/inspection helper: vitality toward `dest` as currently stored (un-aged-to-now).
     pub fn peek_vit(&self, dest: &RouterId) -> Option<f64> {
         self.dest_slot.get(dest).map(|&d| self.vit[d])
@@ -383,5 +397,39 @@ mod tests {
         let route = a.route(tick * 5, &RouterId::from("b")).unwrap();
         assert_eq!(route.via, Some(NeighborId(1)));
         assert!(route.routable, "V≈0.93 ≥ φ=0.5 and f≈0.95 ≥ floor ⇒ routable");
+    }
+
+    /// Two neighbours advertise the SAME potential toward d, but over links of different
+    /// conductance (N2 fat g=5, N1 thin g=1). The current split `w = g·(pot−f)` makes the fat link
+    /// dominate, while BOTH are retained in the uphill set (RING multipath). Ports
+    /// `TestPerLinkConductanceSteersRouting`.
+    #[test]
+    fn conductance_steers_dominant_and_retains_full_set() {
+        let cfg = Config::default();
+        let mut a = Engine::new(RouterId::from("a"), px(1), cfg, Default::default());
+        a.add_neighbor(NeighborId(1));
+        a.add_neighbor(NeighborId(2));
+        a.set_neighbor_conductance(NeighborId(1), 1.0);
+        a.set_neighbor_conductance(NeighborId(2), 5.0);
+
+        // Both advertise the same potential toward d and hear A.
+        let mk = |from: &str| Message {
+            from: RouterId::from(from),
+            hears: vec![RouterId::from("a")],
+            delta: vec![Entry { dest: RouterId::from("d"), prefix: px(9), pot: 0.9, vit: 1.0 }],
+        };
+        for k in 0..3u32 {
+            let now = cfg.tick * k;
+            a.ingest(now, NeighborId(1), &mk("n1"));
+            a.ingest(now, NeighborId(2), &mk("n2"));
+            a.step(now);
+        }
+
+        let hops = a.peek_hops(&RouterId::from("d")).unwrap();
+        assert_eq!(hops.len(), 2, "both neighbours are uphill");
+        // dominant (first, after descending sort) is the fat link N2
+        assert_eq!(hops[0].via, NeighborId(2));
+        assert!(hops[0].weight > hops[1].weight, "fat link dominates");
+        assert_eq!(a.route(cfg.tick * 3, &RouterId::from("d")).unwrap().via, Some(NeighborId(2)));
     }
 }
