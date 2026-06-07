@@ -1,6 +1,11 @@
 # rrd CNI + single-node RKE2 bring-up
 
-Status: M0 CNI shim exists as workspace crate `rrd-cni`.
+Status: M1 live chained CNI observer is installed on the local RKE2/Flannel node.
+
+- `rrd-cni` is installed in `/opt/cni/bin/rrd-cni`.
+- `rrd-agent` is installed in `/usr/local/bin/rrd-agent` and runs as `rrd-agent.service`.
+- `rrdctl` is installed in `/usr/local/bin/rrdctl`.
+- Flannel's active conflist appends `rrd-cni` after `flannel -> portmap -> bandwidth`.
 
 ## What exists now
 
@@ -8,7 +13,7 @@ Status: M0 CNI shim exists as workspace crate `rrd-cni`.
 
 Implemented CNI commands:
 
-- `VERSION`: prints supported CNI versions.
+- `VERSION`: prints supported CNI versions, including RKE2 Flannel's `0.3.1` conflist version.
 - `ADD`: parses CNI stdin/env, extracts `prevResult.ips[*].address`, emits a `pod_added` JSON event to a Unix socket, and returns `prevResult` unchanged.
 - `DEL`: emits `pod_deleted` when possible and succeeds idempotently if the agent socket is absent.
 - `CHECK`: emits `pod_checked` and writes no stdout on success.
@@ -138,7 +143,7 @@ cluster domain: spark.local
 cluster DNS: 10.43.0.10
 ```
 
-The active CNI conflist is:
+The active CNI conflist is now:
 
 ```json
 {
@@ -163,9 +168,20 @@ The active CNI conflist is:
       "capabilities": {
         "bandwidth": true
       }
+    },
+    {
+      "type": "rrd-cni",
+      "socket": "/run/rrd/agent.sock",
+      "advertise": "pod"
     }
   ]
 }
+```
+
+A base rollback copy exists at:
+
+```text
+/etc/cni/net.d/10-flannel.conflist.base-before-rrd
 ```
 
 DNS smoke from temporary BusyBox pods resolved:
@@ -185,41 +201,52 @@ BusyBox `nslookup kubernetes.default.svc` still returned NXDOMAIN because BusyBo
 
 Note: `.local` is mDNS-reserved outside Kubernetes. That is intentional here because the host is reached as `spark.local`; keep in mind that host-level `.local` lookups and in-cluster CoreDNS `.spark.local` are separate resolver contexts.
 
-## First chained CNI config sketch
+## Live M1 smoke test
 
-Once `rrd-agent` exists and listens on `/run/rrd/agent.sock`, install `rrd-cni` as a chained plugin after the primary plugin. The exact file should be derived from the live RKE2 CNI config under `/etc/cni/net.d`.
+A temporary BusyBox pod exercised the real CNI chain:
 
-Conceptual shape:
+```bash
+kubectl run rrd-cni-smoke --image=busybox:1.36 --restart=Never --command -- sleep 120
+kubectl wait --for=condition=Ready pod/rrd-cni-smoke --timeout=120s
+rrdctl pods
+kubectl delete pod rrd-cni-smoke
+rrdctl status
+```
+
+Observed `pod_added` state:
 
 ```json
 {
-  "cniVersion": "1.0.0",
-  "name": "rrd-chain",
-  "plugins": [
-    {
-      "type": "<existing-rke2-primary-plugin>"
-    },
-    {
-      "type": "rrd-cni",
-      "socket": "/run/rrd/agent.sock",
-      "advertise": "pod"
-    }
-  ]
+  "container_id": "9723d277d0a5b3e5e0ef9bb4f1432238baa156963ed5c0b5d2ab3e134b8c99f4",
+  "netns": "/var/run/netns/cni-8ce660ab-8ab5-e5d0-75a9-eb915e73806b",
+  "ifname": "eth0",
+  "network": "cbr0",
+  "ips": ["10.42.0.27/24"]
 }
 ```
 
-Do not blindly overwrite RKE2's generated config. First inspect `/etc/cni/net.d`, then create a reversible backup and patch only after we know the exact active config shape.
+After deletion, `rrdctl status` showed:
+
+```json
+{
+  "add_events": 1,
+  "delete_events": 1,
+  "events_seen": 2,
+  "invalid_events": 0,
+  "pod_count": 0
+}
+```
+
+The node remained Ready and `kube-system/kube-flannel-ds` remained 1/1 ready after chaining.
 
 ## Next implementation milestone
 
-M1 should add the long-running consumer:
+M2 should connect lifecycle observations to RRD routing intent:
 
 ```text
 rrd-agent
-  - binds /run/rrd/agent.sock
-  - accepts newline-delimited JSON lifecycle events from rrd-cni
-  - stores local pod records by container_id
-  - exposes inspection: local pods, advertised prefixes, route state
+  - maps pod_added/pod_deleted into advertised local prefixes
+  - supports advertise=pod and advertise=nodePodCIDR modes
+  - exposes advertised prefixes and eventually desired/installed routes via rrdctl
+  - prepares the handoff to the RING daemon/dataplane route installer
 ```
-
-Until M1 lands, `rrd-cni` is intentionally tested against a fake Unix socket agent.

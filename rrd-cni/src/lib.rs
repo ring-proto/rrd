@@ -10,7 +10,7 @@ use thiserror::Error;
 
 const DEFAULT_SOCKET: &str = "/run/rrd/agent.sock";
 const DEFAULT_CNI_VERSION: &str = "1.1.0";
-const SUPPORTED_VERSIONS: &[&str] = &["0.4.0", "1.0.0", "1.1.0"];
+const SUPPORTED_VERSIONS: &[&str] = &["0.3.1", "0.4.0", "1.0.0", "1.1.0"];
 
 #[derive(Debug, Error)]
 pub enum CniError {

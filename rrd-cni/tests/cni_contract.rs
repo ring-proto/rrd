@@ -35,6 +35,10 @@ fn version_prints_supported_cni_versions_without_agent_socket() {
     assert!(result["supportedVersions"]
         .as_array()
         .unwrap()
+        .contains(&Value::String("0.3.1".into())));
+    assert!(result["supportedVersions"]
+        .as_array()
+        .unwrap()
         .contains(&Value::String("1.0.0".into())));
     assert!(result["supportedVersions"]
         .as_array()
