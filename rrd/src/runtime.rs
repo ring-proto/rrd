@@ -1,0 +1,260 @@
+//! Engine-driver runtime for the RING routing daemon.
+//!
+//! [`Daemon<T>`] owns a `ring_core::Engine`, drives the tick loop, receives datagrams,
+//! discovers neighbours, and publishes a [`RibSnapshot`] via a `watch` channel every tick.
+//!
+//! # Design
+//! - The engine is single-owner inside the `run` loop (no locks).
+//! - Neighbour discovery: first datagram from an unseen `(iface, src_ip)` → allocate
+//!   `NeighborId`, `engine.add_neighbor(nid)`.
+//! - RIB snapshots are published via `tokio::sync::watch` after every tick so that
+//!   observers (tests, HTTP handler) can cheaply poll the latest state.
+//! - `Daemon::new` returns `(Daemon<T>, watch::Receiver<RibSnapshot>)` so callers retain
+//!   the receiver before `run` consumes `self`.
+
+use crate::config::DaemonConfig;
+use crate::transport::{Inbound, Transport};
+use crate::wire;
+use ring_core::{Engine, Mono, NeighborId, Prefix, RouterId};
+use std::collections::HashMap;
+use std::net::Ipv6Addr;
+use std::time::Instant;
+use tokio::sync::watch;
+use tokio::time;
+use std::future::Future;
+
+/// A base offset added to every `now()` so the first engine age is harmless.
+/// Value: 1000 ticks worth of time (matching the ring-sim convention).
+fn base_offset(tick: Mono) -> Mono {
+    tick * 1000
+}
+
+/// A snapshot of the RIB published each tick.
+#[derive(Clone, Debug, Default)]
+pub struct RibSnapshot {
+    /// Destinations currently routable: `(router-id, their announced prefix)`.
+    pub routable: Vec<(RouterId, Prefix)>,
+}
+
+/// Maximum number of distinct destinations the engine will intern from untrusted wire input.
+/// This bounds `intern_dest` growth from adversarial advertisements.
+const MAX_DESTS: usize = 4096;
+
+/// The engine-driver daemon.  Generic over the transport so tests can use `MemTransport`.
+pub struct Daemon<T: Transport> {
+    engine: Engine,
+    transport: T,
+    cfg: DaemonConfig,
+    start: Instant,
+    /// Forward map: (iface, src_ip) → NeighborId
+    neighbor_by_addr: HashMap<(u32, Ipv6Addr), NeighborId>,
+    /// Reverse map: NeighborId → (iface, src_ip) for M3 next-hop locator
+    addr_by_neighbor: HashMap<NeighborId, (u32, Ipv6Addr)>,
+    /// Last-heard wall-clock time per neighbor, for freshness sweeping.
+    heard_at: HashMap<NeighborId, Instant>,
+    /// Prefix → RouterId learned from wire messages, for RIB snapshot building.
+    prefix_to_rid: HashMap<Prefix, RouterId>,
+    next_nid: u32,
+    rib_tx: watch::Sender<RibSnapshot>,
+}
+
+impl<T: Transport> Daemon<T> {
+    /// Create a new daemon and return a cloned watch receiver for the RIB.
+    ///
+    /// The receiver stays live as long as the sender (held by the daemon) is alive,
+    /// so it is valid across the `run` call even though `run` consumes `self`.
+    pub fn new(cfg: DaemonConfig, transport: T) -> (Self, watch::Receiver<RibSnapshot>) {
+        let engine = Engine::new(
+            cfg.router_id.clone(),
+            cfg.prefix,
+            cfg.cfg,
+            cfg.policy,
+        );
+        let (rib_tx, rib_rx) = watch::channel(RibSnapshot::default());
+        // Pre-seed the prefix_to_rid with our own router-id.
+        let mut prefix_to_rid = HashMap::new();
+        prefix_to_rid.insert(cfg.prefix, cfg.router_id.clone());
+
+        let daemon = Daemon {
+            engine,
+            transport,
+            cfg,
+            start: Instant::now(),
+            neighbor_by_addr: HashMap::new(),
+            addr_by_neighbor: HashMap::new(),
+            heard_at: HashMap::new(),
+            prefix_to_rid,
+            next_nid: 0,
+            rib_tx,
+        };
+        (daemon, rib_rx)
+    }
+
+    /// Current monotonic time fed to the engine.
+    fn now(&self) -> Mono {
+        base_offset(self.cfg.cfg.tick) + self.start.elapsed()
+    }
+
+    /// Resolve or allocate a NeighborId for `(iface, src_ip)`.
+    fn resolve_neighbor(&mut self, iface: u32, src_ip: Ipv6Addr) -> NeighborId {
+        let key = (iface, src_ip);
+        if let Some(&nid) = self.neighbor_by_addr.get(&key) {
+            return nid;
+        }
+        let nid = NeighborId(self.next_nid);
+        self.next_nid += 1;
+        self.neighbor_by_addr.insert(key, nid);
+        self.addr_by_neighbor.insert(nid, key);
+        self.engine.add_neighbor(nid);
+        tracing::debug!("new neighbor {:?} from iface={} src={}", nid, iface, src_ip);
+        nid
+    }
+
+    /// Handle a decoded inbound datagram.
+    fn handle_inbound(&mut self, inb: Inbound) {
+        match wire::decode(&inb.data) {
+            Ok(msg) => {
+                let src_ip = *inb.src.ip();
+                let nid = self.resolve_neighbor(inb.iface, src_ip);
+                // Record heard time for freshness tracking.
+                self.heard_at.insert(nid, Instant::now());
+
+                // Learn prefix → RouterId mapping from the `from` field + self-pin entry.
+                // The self-pin entry has dest == msg.from; register it so snapshot can look up.
+                for entry in &msg.delta {
+                    if entry.dest == msg.from {
+                        self.prefix_to_rid.entry(entry.prefix).or_insert_with(|| msg.from.clone());
+                    }
+                }
+
+                // CAP: guard against dest table explosion from untrusted input.
+                let dest_count = self.prefix_to_rid.len();
+                if dest_count >= MAX_DESTS {
+                    tracing::debug!(
+                        "dest table at {} entries, dropping inbound delta from {:?}",
+                        dest_count, msg.from
+                    );
+                    return;
+                }
+
+                let now = self.now();
+                self.engine.ingest(now, nid, &msg);
+            }
+            Err(e) => {
+                tracing::debug!("wire decode error: {}", e);
+            }
+        }
+    }
+
+    /// Drop neighbours silent for longer than `fresh` ticks.
+    fn sweep_stale(&mut self) {
+        let tick = self.cfg.cfg.tick;
+        let fresh = self.cfg.cfg.fresh;
+        // Use a slightly generous threshold (fresh + 1 tick) to avoid racing with slow ticks.
+        let stale_threshold = tick.mul_f64(fresh + 1.0);
+
+        let stale: Vec<NeighborId> = self
+            .heard_at
+            .iter()
+            .filter(|(_, t)| t.elapsed() > stale_threshold)
+            .map(|(&nid, _)| nid)
+            .collect();
+
+        for nid in stale {
+            tracing::debug!("dropping stale neighbor {:?}", nid);
+            self.engine.drop_neighbor(nid);
+            self.heard_at.remove(&nid);
+            if let Some(key) = self.addr_by_neighbor.remove(&nid) {
+                self.neighbor_by_addr.remove(&key);
+            }
+        }
+    }
+
+    /// Build a RIB snapshot from the engine's current desired_routes.
+    fn build_snapshot(&self) -> RibSnapshot {
+        let now = self.now();
+        let routable: Vec<(RouterId, Prefix)> = self
+            .engine
+            .desired_routes(now)
+            .filter(|r| r.routable)
+            .filter_map(|r| {
+                self.prefix_to_rid.get(&r.prefix).map(|rid| (rid.clone(), r.prefix))
+            })
+            .collect();
+        tracing::debug!(
+            "RIB snapshot: {} routable dests",
+            routable.len()
+        );
+        RibSnapshot { routable }
+    }
+
+    /// Run the daemon until `shutdown` resolves.
+    pub async fn run(mut self, mut shutdown: impl Future<Output = ()> + Unpin) {
+        let tick_dur = self.cfg.cfg.tick;
+        let mut interval = time::interval(tick_dur);
+        // Avoid tick bursting after a long sleep.
+        interval.set_missed_tick_behavior(time::MissedTickBehavior::Skip);
+
+        loop {
+            tokio::select! {
+                _ = interval.tick() => {
+                    let now = self.now();
+                    let out = self.engine.step(now);
+                    let encoded = wire::encode(&out.emit);
+                    let _ = self.transport.send(&encoded).await;
+                    self.sweep_stale();
+                    let snap = self.build_snapshot();
+                    let _ = self.rib_tx.send(snap);
+                }
+                result = self.transport.recv() => {
+                    match result {
+                        Ok(inb) => self.handle_inbound(inb),
+                        Err(e) => {
+                            tracing::warn!("transport recv error: {}", e);
+                            break;
+                        }
+                    }
+                }
+                _ = &mut shutdown => {
+                    tracing::info!("shutdown requested");
+                    break;
+                }
+            }
+        }
+    }
+}
+
+// ─────────────────────────────────── tests ───────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::DaemonConfig;
+    use crate::transport::MemBus;
+    use ring_core::{Config, ForwardingPolicy};
+    use std::net::Ipv6Addr;
+    use std::time::Duration;
+
+    fn make_config(id: &str, prefix_addr: Ipv6Addr, tick_ms: u64) -> DaemonConfig {
+        let mut cfg = Config::default();
+        cfg.tick = Duration::from_millis(tick_ms);
+        DaemonConfig {
+            router_id: RouterId(id.to_string()),
+            prefix: Prefix { addr: prefix_addr, len: 64 },
+            ifaces: vec![],
+            cfg,
+            policy: ForwardingPolicy::default(),
+        }
+    }
+
+    #[tokio::test]
+    async fn daemon_new_returns_watch_receiver() {
+        let mut transports = MemBus::fully_connected(1);
+        let t = transports.remove(0);
+        let cfg = make_config("n0", "fd00::1".parse().unwrap(), 100);
+        let (_daemon, rx) = Daemon::new(cfg, t);
+        // The initial snapshot is the default empty one.
+        let snap = rx.borrow();
+        assert!(snap.routable.is_empty());
+    }
+}

@@ -12,7 +12,7 @@ impl From<&str> for RouterId {
 }
 
 /// A node's announced ULA prefix — what gets installed into the FIB toward it.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub struct Prefix {
     pub addr: Ipv6Addr,
     pub len: u8,
