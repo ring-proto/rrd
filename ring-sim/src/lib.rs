@@ -4,3 +4,5 @@
 //! deterministic and reads no real clock, so a whole run is reproducible from a seed.
 pub mod rng;
 pub mod event;
+pub mod fabric;
+pub use fabric::{Fabric, LinkSpec};
