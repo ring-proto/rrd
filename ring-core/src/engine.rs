@@ -143,6 +143,23 @@ impl Engine {
         self.dest_slot.get(dest).map(|&d| self.f[d])
     }
 
+    /// Set an optional externally-offered extra load (for staging congestion scenarios). The base
+    /// congestion signal is the node's self-measured carried current; this adds to it.
+    pub fn set_stress(&mut self, s: f64) {
+        self.stress = s;
+    }
+
+    /// The node's current congestion screening charge µ (instrumentation).
+    pub fn charge(&self) -> f64 {
+        self.charge
+    }
+
+    /// The node's self-measured carried current (the up-gradient flux it forwards), which drives
+    /// the congestion charge.
+    pub fn load(&self) -> f64 {
+        self.load
+    }
+
     /// The data-plane read: dominant next-hop, vitality aged to `now`, and the routability gate
     /// `known ∧ V ≥ φ`, where `known = f ≥ floor ∧ via defined`. Returns `None` only when `dest`
     /// has never been interned (never heard of); a known-but-degraded destination returns
@@ -510,5 +527,33 @@ mod tests {
         let r = a.route(far, &RouterId::from("d")).unwrap();
         assert!(!r.routable, "should sever once V < φ (V={})", r.vit);
         assert!(r.via.is_some(), "direction is still known — severance is not deletion");
+    }
+
+    #[test]
+    fn charge_is_inert_when_congestion_off() {
+        let cfg = Config::default(); // crowd = 0
+        let mut a = Engine::new(RouterId::from("a"), px(1), cfg, Default::default());
+        for k in 0..50u32 {
+            a.step(cfg.tick * k);
+        }
+        assert_eq!(a.charge(), 0.0);
+    }
+
+    #[test]
+    fn charge_glides_toward_target_without_overshoot() {
+        let mut cfg = Config::default();
+        cfg.crowd = 1.0;
+        cfg.glide = 1.0;
+        let mut a = Engine::new(RouterId::from("a"), px(1), cfg, Default::default());
+        a.set_stress(3.0); // target = crowd·stress = 3.0
+        let mut prev = a.charge();
+        for k in 0..400u32 {
+            a.step(cfg.tick * k);
+            let c = a.charge();
+            assert!(c >= prev - 1e-12, "non-monotone: {c} < {prev}");
+            assert!(c <= 3.0 + 1e-9, "overshoot: {c}");
+            prev = c;
+        }
+        assert!(a.charge() > 2.9, "should approach target: {}", a.charge());
     }
 }
