@@ -105,7 +105,10 @@ impl DaemonConfig {
             .map(|name| resolve_iface(name))
             .collect::<Result<Vec<_>, _>>()?;
 
-        let mut cfg = Config { tick: Duration::from_millis(cli.tick_ms), ..Config::default() };
+        let mut cfg = Config {
+            tick: Duration::from_millis(cli.tick_ms),
+            ..Config::default()
+        };
         if let Some(k) = cli.kappa {
             cfg.kappa = k;
         }
@@ -116,7 +119,14 @@ impl DaemonConfig {
             cfg.phi = p;
         }
 
-        Ok(DaemonConfig { router_id, prefix, ifaces, cfg, policy: ForwardingPolicy::default(), no_fib: cli.no_fib })
+        Ok(DaemonConfig {
+            router_id,
+            prefix,
+            ifaces,
+            cfg,
+            policy: ForwardingPolicy::default(),
+            no_fib: cli.no_fib,
+        })
     }
 }
 
@@ -164,11 +174,16 @@ mod tests {
     fn cli_parse_sample_argv() {
         let args = vec![
             "rrd",
-            "--router-id", "test-node",
-            "--prefix", "fd00:0:1::/64",
-            "--iface", "lo",
-            "--tick-ms", "50",
-            "--kappa", "0.1",
+            "--router-id",
+            "test-node",
+            "--prefix",
+            "fd00:0:1::/64",
+            "--iface",
+            "lo",
+            "--tick-ms",
+            "50",
+            "--kappa",
+            "0.1",
         ];
         let cli = Cli::try_parse_from(args).expect("should parse");
         assert_eq!(cli.router_id, "test-node");

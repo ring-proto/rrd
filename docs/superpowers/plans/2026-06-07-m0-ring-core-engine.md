@@ -51,7 +51,7 @@ pub struct Route        { pub via: Option<NeighborId>, pub vit: f64, pub routabl
 pub struct DesiredRoute { pub prefix: Prefix, pub nexthops: smallvec::SmallVec<[WeightedHop; 4]>, pub routable: bool }
 
 pub struct Config { pub d: f64, pub kappa: f64, pub f0: f64, pub floor: f64,
-                    pub alpha: f64, pub phi: f64, pub tick: Mono, pub fresh: f64,
+                    pub alpha: f64, pub phi: f64, pub tick: Mono,
                     pub crowd: f64, pub glide: f64, pub no_retard: bool }
 pub struct ForwardingPolicy { pub max_paths: usize, pub weight_quantum: f64 }
 ```
@@ -359,7 +359,6 @@ pub struct Config {
     pub alpha: f64,    // vitality aging rate per tick
     pub phi: f64,      // vitality action threshold
     pub tick: Mono,    // proper-time quantum AND emission period (coupled, per the design)
-    pub fresh: f64,    // link freshness window, in ticks
     pub crowd: f64,    // congestion coupling c (0 = off)
     pub glide: f64,    // glide rate r of reg()
     pub no_retard: bool, // ablation: adopt vitality un-aged (demonstrates Thm 6.2)
@@ -375,7 +374,6 @@ impl Default for Config {
             alpha: 0.04,
             phi: 0.5,
             tick: Duration::from_millis(100),
-            fresh: 8.0,
             crowd: 0.0,
             glide: 1.0,
             no_retard: false,
@@ -407,7 +405,6 @@ mod tests {
         assert_eq!(c.alpha, 0.04);
         assert_eq!(c.phi, 0.5);
         assert_eq!(c.floor, 1e-4);
-        assert_eq!(c.fresh, 8.0);
         assert_eq!(c.crowd, 0.0); // congestion off by default
         assert!(!c.no_retard);
     }
@@ -485,7 +482,7 @@ git commit -m "feat(ring-core): core id/message/config types"
 
 ## Task 4: Engine skeleton — state, `new`, self-pin emit
 
-A fresh engine with no neighbours. `step` produces a `Message` carrying only the self-pin
+A new engine with no neighbours. `step` produces a `Message` carrying only the self-pin
 (`dest=self, pot=F0, vit=1`) and no routable destinations.
 
 **Files:**
@@ -508,7 +505,7 @@ mod tests {
     }
 
     #[test]
-    fn fresh_engine_emits_only_self_pin() {
+    fn new_engine_emits_only_self_pin() {
         let cfg = Config::default();
         let mut e = Engine::new(RouterId::from("a"), px(1), cfg, Default::default());
         let out = e.step(Duration::ZERO);
@@ -709,11 +706,11 @@ impl Engine {
         self.last_aged = now;
     }
 
-    /// Bidirectional, fresh neighbours (the only ones that contribute to relaxation / forwarding).
+    /// Bidirectional neighbours (the only ones that contribute to relaxation / forwarding).
     fn bidir(&self, now: Mono) -> Vec<NeighborId> {
         let mut out = Vec::new();
         for (id, p) in &self.neighbors {
-            if p.hears && ticks_between(p.heard, now, self.cfg.tick) < self.cfg.fresh {
+            if p.hears {
                 out.push(*id);
             }
         }
@@ -721,11 +718,11 @@ impl Engine {
         out
     }
 
-    /// The neighbours we currently hear (freshness only) — the `Hears` echo we advertise.
+    /// The neighbours we currently hear — the `Hears` echo we advertise.
     fn heard_list(&self, now: Mono) -> Vec<RouterId> {
         let mut out = Vec::new();
         for p in self.neighbors.values() {
-            if ticks_between(p.heard, now, self.cfg.tick) < self.cfg.fresh {
+            if self.peer_conductance(p, now) > self.cfg.floor {
                 // a neighbour's router-id is learned at ingest time (Task 5 stores it); until then
                 // we have no id to echo. Resolved in Task 5 by keying Peer with its RouterId.
             }
@@ -740,7 +737,7 @@ Note: `heard_list` is a stub here (returns empty) because echoing requires the n
 
 - [ ] **Step 3: Run the test to verify it fails, then passes**
 
-Run: `cargo test -p ring-core engine::tests::fresh_engine_emits_only_self_pin`
+Run: `cargo test -p ring-core engine::tests::new_engine_emits_only_self_pin`
 Expected: compiles and PASSES (the self-pin path is fully implemented).
 
 If it fails to compile, fix the reported error (e.g. a missing derive) before proceeding.
@@ -894,7 +891,7 @@ Now complete `heard_list` (replace the stub body):
         let mut out = Vec::new();
         for p in self.neighbors.values() {
             if let Some(id) = &p.id {
-                if ticks_between(p.heard, now, self.cfg.tick) < self.cfg.fresh {
+                if self.peer_conductance(p, now) > self.cfg.floor {
                     out.push(id.clone());
                 }
             }
@@ -995,7 +992,7 @@ Expected: PASS. (B's advertised pot toward itself is fixed at `F0`, so A's singl
 balance reaches the closed form in one relaxation once bidirectional.)
 
 If `via` is `None`, check the handshake: B's message must list A in `hears`, and the step must
-occur at a time within `Fresh` ticks of the ingest.
+occur after a recent ingest in engine time.
 
 - [ ] **Step 4: Run the whole suite**
 
@@ -1486,7 +1483,7 @@ git commit -m "test(ring-core): engine field equals centralized solver (line + m
 
 **Spec coverage (against §3.2 of the design spec):**
 - Dense per-destination `f`/`vit`/`dominant`/`hops`, dynamic `DestTable`, local index never on the wire → Tasks 4–6. ✓
-- `hears`/`heard` asymmetry, bidirectional+fresh gate → Tasks 4–5 (`bidir`, `heard_list`). ✓
+- `hears`/`heard` asymmetry, bidirectional link-aging → Tasks 4–5 (`bidir`, `heard_list`). ✓
 - Retarded adopt-max + `no_retard` ablation → Task 5. ✓
 - Screened-Jacobi relax, current split retained (multipath), dominant via, load → Tasks 4, 6, 7. ✓
 - `route` + `desired_routes`, φ/floor gate, `max_paths` cap → Tasks 6, 8. ✓

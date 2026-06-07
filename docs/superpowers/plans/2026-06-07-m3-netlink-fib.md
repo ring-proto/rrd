@@ -72,7 +72,7 @@ A script that builds the binary, runs the lab, and ASSERTS the live behaviour. I
 2. `lab_up 3` (line ring0-ring1-ring2). Wait for convergence (sleep a few seconds; poll `ip -6 route show proto ring`).
 3. **Assert routes installed:** `ring0` has a `proto ring` route to `fd00:ring:2::/64` via a `fe80::… dev veth…`; similarly `ring2`→`fd00:ring:0::/64`. FAIL if absent after the timeout.
 4. **Assert end-to-end ping:** `sudo ip netns exec ring0 ping6 -c 3 -W 1 fd00:ring:2::1` succeeds (0% loss tolerated to e.g. ≤1/3). This is RING routing real packets across 2 hops. Print the ping summary.
-5. **Assert sever on link cut:** cut the ring1–ring2 link (`sudo ip netns exec ring1 ip link set <veth to ring2> down`, or delete the veth). Wait > a few `fresh` windows. Assert `ring0`'s route to `fd00:ring:2::/64` is WITHDRAWN (gone from `ip -6 route`) and `ping6` now FAILS (100% loss) — correct severance.
+5. **Assert sever on link cut:** cut the ring1–ring2 link (`sudo ip netns exec ring1 ip link set <veth to ring2> down`, or delete the veth). Wait across the link-aging horizon. Assert `ring0`'s route to `fd00:ring:2::/64` is WITHDRAWN (gone from `ip -6 route`) and `ping6` now FAILS (100% loss) — correct severance.
 6. **Assert heal:** bring the link back up; wait; assert the route reappears and `ping6` succeeds again.
 7. `lab_down` (and via trap). Print a final `DEMO: PASS` / `DEMO: FAIL` summary line.
 

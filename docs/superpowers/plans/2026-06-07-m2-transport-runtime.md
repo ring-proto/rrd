@@ -6,7 +6,7 @@
 
 **Goal:** A real `rrd` daemon: each instance runs the `ring-core` engine, discovers neighbours and exchanges advertisements over an IPv6 link-local multicast group, and converges — observable via a RIB query. No kernel FIB yet (that's M3). The runtime is transport-agnostic (a `Transport` trait) so the whole driver loop is tested in-process over a `MemTransport`; the real `Udp6Transport` is built here and exercised live in M3's netns lab.
 
-**Architecture:** A `rrd` crate with a **lib** (`wire`, `transport`, `runtime`, `config`) + a thin **bin** (`main.rs`). Tokio single-engine-owner runtime: an engine task owns `ring_core::Engine`; transport delivers `(iface, src, bytes)` which decode to `Message` and `ingest`; a tick drives `step`→emit; freshness sweeps stale neighbours. All untrusted input is validated at the wire boundary.
+**Architecture:** A `rrd` crate with a **lib** (`wire`, `transport`, `runtime`, `config`) + a thin **bin** (`main.rs`). Tokio single-engine-owner runtime: an engine task owns `ring_core::Engine`; transport delivers `(iface, src, bytes)` which decode to `Message` and `ingest`; a tick drives `step`→emit; link-aging drains silent neighbours. All untrusted input is validated at the wire boundary.
 
 **Spec:** design spec §3.3 (runtime/modules), §3.4 (discovery/identity), §4 (wire format). **Refs:** Babel (RFC 8966) uses UDP to `ff02::1:6` port 6696 — the lineage. **Engine API:** `ring_core::Engine::{new, add_neighbor, drop_neighbor, set_neighbor_conductance, ingest(now,from,&Message), step(now)->StepOutput, route(now,&RouterId)->Option<Route>, desired_routes(now)}`; `Mono = Duration` (pass `start.elapsed()`); `NeighborId(u32)`.
 
@@ -100,7 +100,7 @@ Real per-interface IPv6 link-local multicast. Built here; **live-verified in M3*
   - a `tokio::time::interval(tick)` for emit;
   - `transport.recv()` for inbound;
   - on inbound: `wire::decode` (drop + `tracing::debug!` on `WireError`), resolve/allocate `NeighborId`, **sanitize entries** (the decoder already rejected NaN/range; additionally CAP the number of distinct destinations the engine will intern — e.g. a `max_dests` guard — to bound `intern_dest` on untrusted input), then `engine.ingest(now(), nid, &msg)`;
-  - on tick: `let out = engine.step(now()); transport.send(&wire::encode(&out.emit)).await;` then run a freshness sweep (drop neighbours unheard for `> fresh` ticks via `engine.drop_neighbor`);
+  - on tick: `let out = engine.step(now()); transport.send(&wire::encode(&out.emit)).await;` then rely on reciprocal link aging for silent neighbours; pruning is a later non-load-bearing GC policy;
   - on shutdown: break.
 - `now(&self) -> Mono` = `self.start.elapsed()` + a base offset (so the engine's first age is harmless, as in the sim).
 - **RIB query:** `pub fn rib(&self) -> Vec<RibEntry>` (or a snapshot via `engine.desired_routes(now)`), plus periodic `tracing::info!` of routable destinations (for observability and the convergence test).
@@ -134,6 +134,6 @@ Real per-interface IPv6 link-local multicast. Built here; **live-verified in M3*
 - Big-endian wire integers + `f64::to_be_bytes` (consistent; supersedes spec's "LE").
 
 ## Self-review (planning)
-- Covers spec §3.3/§3.4/§4: wire codec, transport (real + test), discovery/identity (NeighborId ↔ (iface,src)), the engine-driver loop (ingest/step/emit/freshness), CLI/config, RIB observability, main. ✓
+- Covers spec §3.3/§3.4/§4: wire codec, transport (real + test), discovery/identity (NeighborId ↔ (iface,src)), the engine-driver loop (ingest/step/emit/link-aging), CLI/config, RIB observability, main. ✓
 - Deferred M0 hardening (untrusted intern cap, NaN/range validation) addressed at the wire boundary. ✓
 - Out of scope (M3): netlink FIB install/withdraw; live netns demo; real ping. The runtime stores the (src,iface) next-hop locator now so M3 can install it.

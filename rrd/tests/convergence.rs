@@ -4,10 +4,10 @@
 //! router-id and prefix. Asserts that within 5 seconds every daemon's RIB snapshot lists
 //! the other two router-ids as routable.
 
+use ring_core::{Config, ForwardingPolicy, Prefix, RouterId};
 use rrd::config::DaemonConfig;
 use rrd::runtime::{Daemon, RibSnapshot};
 use rrd::transport::MemBus;
-use ring_core::{Config, ForwardingPolicy, Prefix, RouterId};
 use std::net::Ipv6Addr;
 use std::time::Duration;
 use tokio::sync::watch;
@@ -15,11 +15,12 @@ use tokio::sync::watch;
 fn make_config(id: &str, prefix_addr: Ipv6Addr, tick_ms: u64) -> DaemonConfig {
     let mut cfg = Config::default();
     cfg.tick = Duration::from_millis(tick_ms);
-    // Lower fresh threshold to speed up test convergence.
-    cfg.fresh = 6.0;
     DaemonConfig {
         router_id: RouterId(id.to_string()),
-        prefix: Prefix { addr: prefix_addr, len: 64 },
+        prefix: Prefix {
+            addr: prefix_addr,
+            len: 64,
+        },
         ifaces: vec![],
         cfg,
         policy: ForwardingPolicy::default(),
@@ -29,11 +30,9 @@ fn make_config(id: &str, prefix_addr: Ipv6Addr, tick_ms: u64) -> DaemonConfig {
 
 /// Returns true when the RIB snapshot contains router-ids for all of `expected`.
 fn all_routable(snap: &RibSnapshot, expected: &[&str]) -> bool {
-    expected.iter().all(|id| {
-        snap.routable
-            .iter()
-            .any(|(rid, _)| rid.0 == *id)
-    })
+    expected
+        .iter()
+        .all(|id| snap.routable.iter().any(|(rid, _)| rid.0 == *id))
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -92,14 +91,44 @@ async fn three_daemons_converge() {
 
     if converged.is_err() {
         // Print diagnostic info on failure.
-        eprintln!("n0 RIB: {:?}", s0.routable.iter().map(|(r,_)| r.0.as_str()).collect::<Vec<_>>());
-        eprintln!("n1 RIB: {:?}", s1.routable.iter().map(|(r,_)| r.0.as_str()).collect::<Vec<_>>());
-        eprintln!("n2 RIB: {:?}", s2.routable.iter().map(|(r,_)| r.0.as_str()).collect::<Vec<_>>());
+        eprintln!(
+            "n0 RIB: {:?}",
+            s0.routable
+                .iter()
+                .map(|(r, _)| r.0.as_str())
+                .collect::<Vec<_>>()
+        );
+        eprintln!(
+            "n1 RIB: {:?}",
+            s1.routable
+                .iter()
+                .map(|(r, _)| r.0.as_str())
+                .collect::<Vec<_>>()
+        );
+        eprintln!(
+            "n2 RIB: {:?}",
+            s2.routable
+                .iter()
+                .map(|(r, _)| r.0.as_str())
+                .collect::<Vec<_>>()
+        );
         panic!("daemons did not converge within 5 seconds");
     }
 
     // Verify the actual RIB entries (convergence was real, not trivial).
-    assert_eq!(s0.routable.len(), 2, "n0 should have exactly 2 routable dests");
-    assert_eq!(s1.routable.len(), 2, "n1 should have exactly 2 routable dests");
-    assert_eq!(s2.routable.len(), 2, "n2 should have exactly 2 routable dests");
+    assert_eq!(
+        s0.routable.len(),
+        2,
+        "n0 should have exactly 2 routable dests"
+    );
+    assert_eq!(
+        s1.routable.len(),
+        2,
+        "n1 should have exactly 2 routable dests"
+    );
+    assert_eq!(
+        s2.routable.len(),
+        2,
+        "n2 should have exactly 2 routable dests"
+    );
 }

@@ -74,7 +74,7 @@ fn dead_source_severs_everywhere() {
     fab.run_ticks(300);
     for d in 1..n { assert!(fab.is_routable(d, 0), "converged toward source 0"); }
     fab.kill_node(0); // the source dies
-    fab.run_ticks(800); // STARTER; severance horizon ~ (1/phi-1)/alpha plus fresh + dwell
+    fab.run_ticks(800); // STARTER; severance horizon ~ (1/phi-1)/alpha plus link-aging dwell
     for d in 1..n {
         assert!(!fab.is_routable(d, 0), "node {d} must sever the dead source 0");
     }

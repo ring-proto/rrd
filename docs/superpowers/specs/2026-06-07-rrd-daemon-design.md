@@ -60,7 +60,7 @@ engineering concentrated in *identity/discovery* and *kernel integration*.
 | **FIB isolation** | Every installed route is tagged `rtm_protocol = RTPROT_RING` and lives in the netns table; reconcile and cleanup only ever touch our own routes. |
 | **Wire format** | Explicit, versioned binary frame; `f64` + plain router-id strings for the PoC; size-bounded and segmentable. |
 | **Tick** | **Coupled** exactly as the reference (aging quantum = retardation unit = emission period), defaulted to a saner ~100ms–1s for the PoC. Cadence-invariance (proven) means α's horizon rescales with Tick. |
-| **Parameters** | Go `DefaultConfig` is canonical: `D=1, κ=0.05, F0=1, Floor=1e-4, α=0.04, φ=0.5, Fresh=8`. (Doc discrepancy resolved in favour of κ=0.05.) |
+| **Parameters** | Go `DefaultConfig` is canonical: `D=1, κ=0.05, F0=1, Floor=1e-4, α≈0.22360679775, φ=0.2`; link and vitality aging share α (`β=α`). |
 | **Congestion** | Hooks implemented (`charge`/`load`/`reg`) but **`Crowd=0` by default** — inert, every guarantee holds at `q_i=κ`. |
 
 ## 3. Architecture
@@ -92,7 +92,7 @@ pub struct Message { from: RouterId, hears: Vec<RouterId>, delta: Vec<Entry> }  
 
 pub struct WeightedHop { via: NeighborId, weight: f64 }   // weight = g_ij·(f_j − f_i), the current split
 
-pub struct Config { d, kappa, f0, floor, alpha, phi, tick: Duration, fresh, crowd, glide }
+pub struct Config { d, kappa, f0, floor, alpha, phi, tick: Duration, crowd, glide, no_retard, no_link_age }
 pub struct ForwardingPolicy { max_paths: usize, weight_quantum: f64 } // PoC: max_paths = 1
 
 pub struct Engine { /* dense Vec<f64> f, vit; weighted-hop buffer; DestTable; neighbour table; charge, load */ }
@@ -100,7 +100,7 @@ pub struct Engine { /* dense Vec<f64> f, vit; weighted-hop buffer; DestTable; ne
 impl Engine {
     fn new(id: RouterId, prefix: Prefix, cfg: Config) -> Self;
     fn add_neighbor(&mut self, n: NeighborId);                              // on discovery
-    fn drop_neighbor(&mut self, n: NeighborId);                            // on freshness expiry / link down
+    fn drop_neighbor(&mut self, n: NeighborId);                            // optional pruning / link-down policy
     fn ingest(&mut self, now: Instant, from: NeighborId, msg: &Message);   // receive → age → retarded adopt-max
     fn step(&mut self, now: Instant) -> StepOutput;                        // age → glide → screened-Jacobi → split → emit
     fn route(&self, now: Instant, dest: &RouterId) -> Option<Route>;       // (dominant via, vit, routable)
@@ -118,13 +118,15 @@ pub struct DesiredRoute { prefix: Prefix, nexthops: SmallVec<[WeightedHop; 4]>, 
   destination whose `f` drains below `Floor` is evicted (reach-ball GC). `Entry.dest` on the
   wire is the `RouterId`.
 - **`hears` vs `heard` asymmetry.** A neighbour contributes to relaxation and is a `via`
-  candidate only while *bidirectional AND fresh*; we advertise one-way hearing in `Hears`.
+  candidate while bidirectional; silent advertisements lose coefficient through reciprocal
+  conductance aging `g_eff = g/(1+α·k·g)`. We advertise
+  one-way hearing in `Hears` while the aged conductance remains above the numerical floor.
 - **Retarded adopt-max.** `ingest` ages held `V`, then `V[d] = max(V[d], age(e.vit, 1))` —
   transit fixed at 1 tick/relay (clock-free). This is what forbids the spurious resurrection
   of a dead source (paper Thm 6.2).
-- **Screened-Jacobi relax.** `step` computes `inv = 1/(Σg + κ + µ)`, `f[d] = inv·Σ_j g_j·pot_j[d]`,
+- **Screened-Jacobi relax.** `step` computes `inv = 1/(Σg_eff + κ + µ)`, `f[d] = inv·Σ_j g_eff,j·pot_j[d]`,
   self pinned at `F0`; one sweep over all destinations as a dense vector op.
-- **Current split, retained (not collapsed).** For every neighbour, `w = g·(pot_j[d] − f[d])`;
+- **Current split, retained (not collapsed).** For every neighbour, `w = g_eff·(pot_j[d] − f[d])`;
   the full uphill set `{w > 0}` is kept (descending), the argmax retained as `dominant` for
   single-path install / `route()` / loop checks.
 - **Injected `now`** makes the engine deterministic — the sim feeds a synthetic clock (and
@@ -146,7 +148,7 @@ its own task; all I/O is fanned out around it over channels.
    tick (interval = cfg.tick) ─▶│   Engine     │   • tick      → out = engine.step(now)
                                 │              │              → multicast out.emit on every iface
    shutdown ───────────────────▶│              │              → publish engine.desired_routes() (watch)
-                                └─────┬────────┘   • freshness sweep → drop stale neighbours
+                                └─────┬────────┘   • stale links lose conductance continuously
                                       │ watch<DesiredRoutes>
                                       ▼
                                 ┌──────────┐   rate-limited reconcile vs kernel (rtnetlink)
@@ -159,7 +161,7 @@ Modules:
 - **`config` / `cli`** (`clap`): router-id (default hostname), announced prefix, interface
   list, Tick, and the engine knobs.
 - **`interfaces`**: enumerate the daemon's L3 interfaces (ifindex + link-local addr) at
-  startup. (Dynamic up/down watching is deferred; freshness handles peer loss.)
+  startup. Dynamic up/down watching remains deferred; stale links fade through conductance aging.
 - **`transport`**: per-interface UDPv6 socket — bind, `IPV6_JOIN_GROUP` the RING group on the
   ifindex, `IPV6_MULTICAST_IF = ifindex`, `IPV6_MULTICAST_HOPS = 1` (link-local, never
   forwarded), `IPV6_MULTICAST_LOOP = 0`, `IPV6_RECVPKTINFO` (learn arrival ifindex). Receive
@@ -167,7 +169,7 @@ Modules:
 - **`wire`**: serialize/deserialize `Message` (§4).
 - **`fib`**: rtnetlink reconciler (§5).
 - **`runtime`**: the task topology above — owns the `Engine`, drives the tick, performs
-  neighbour discovery + the freshness sweep, publishes desired routes.
+  neighbour discovery, and publishes desired routes.
 
 ### 3.4 Neighbour discovery & identity
 
@@ -176,9 +178,10 @@ Modules:
 - The 2-way echo is keyed by **`RouterId`** (stable identity): `neighbor.hears =
   msg.hears.contains(our_router_id)`. `fe80::A` is the transport locator — and the FIB
   next-hop.
-- **Freshness sweep** on each tick: neighbours unheard for `> Fresh` ticks are dropped
-  (removed from relaxation and forwarding). This is the protocol's single staleness window,
-  confined to the link layer.
+- Staleness is series resistance. The engine reads each peer's last-heard engine time as
+  an age and converts it to effective conductance, `1/g_eff = 1/g + αk`; silent neighbours therefore
+  fade out of relaxation and forwarding continuously. Implementations may later prune
+  numerically-negligible peers as memory policy.
 
 ## 4. Wire format
 
@@ -273,7 +276,7 @@ multi-prefix/anycast/policy; control-plane authentication; dynamic interface up/
 |---|---|---|
 | **M0** | Workspace + `ring-core` engine + Layer-1 units | the math is correct in Rust (matches the ideal solver) |
 | **M1** | In-process sim mesh + Layer-2 invariants | the paper's claims reproduced on the Rust engine, no I/O |
-| **M2** | UDPv6 multicast transport + discovery/echo/freshness | real daemons in netns talk and converge — no FIB yet |
+| **M2** | UDPv6 multicast transport + discovery/echo/link aging | real daemons in netns talk and converge — no FIB yet |
 | **M3** | netlink `fib_task` reconciler | RING routes real packets (`ping6` follows the field) |
 | **M4** | Failure/heal demo (+ optional congestion / multipath toggles) | clock-free severance, live, end-to-end |
 

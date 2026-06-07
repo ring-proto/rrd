@@ -18,11 +18,11 @@ use crate::transport::{Inbound, Transport};
 use crate::wire;
 use ring_core::{Engine, Mono, NeighborId, Prefix, RouterId};
 use std::collections::HashMap;
+use std::future::Future;
 use std::net::Ipv6Addr;
 use std::time::Instant;
 use tokio::sync::watch;
 use tokio::time;
-use std::future::Future;
 
 /// A base offset added to every `now()` so the first engine age is harmless.
 /// Value: 1000 ticks worth of time (matching the ring-sim convention).
@@ -51,8 +51,6 @@ pub struct Daemon<T: Transport> {
     neighbor_by_addr: HashMap<(u32, Ipv6Addr), NeighborId>,
     /// Reverse map: NeighborId → (iface, src_ip) for M3 next-hop locator
     addr_by_neighbor: HashMap<NeighborId, (u32, Ipv6Addr)>,
-    /// Last-heard wall-clock time per neighbor, for freshness sweeping.
-    heard_at: HashMap<NeighborId, Instant>,
     /// Prefix → RouterId learned from wire messages, for RIB snapshot building.
     prefix_to_rid: HashMap<Prefix, RouterId>,
     next_nid: u32,
@@ -67,12 +65,7 @@ impl<T: Transport> Daemon<T> {
     /// The receiver stays live as long as the sender (held by the daemon) is alive,
     /// so it is valid across the `run` call even though `run` consumes `self`.
     pub fn new(cfg: DaemonConfig, transport: T) -> (Self, watch::Receiver<RibSnapshot>) {
-        let engine = Engine::new(
-            cfg.router_id.clone(),
-            cfg.prefix,
-            cfg.cfg,
-            cfg.policy,
-        );
+        let engine = Engine::new(cfg.router_id.clone(), cfg.prefix, cfg.cfg, cfg.policy);
         let (rib_tx, rib_rx) = watch::channel(RibSnapshot::default());
         // Pre-seed the prefix_to_rid with our own router-id.
         let mut prefix_to_rid = HashMap::new();
@@ -85,7 +78,6 @@ impl<T: Transport> Daemon<T> {
             start: Instant::now(),
             neighbor_by_addr: HashMap::new(),
             addr_by_neighbor: HashMap::new(),
-            heard_at: HashMap::new(),
             prefix_to_rid,
             next_nid: 0,
             rib_tx,
@@ -120,14 +112,14 @@ impl<T: Transport> Daemon<T> {
             Ok(msg) => {
                 let src_ip = *inb.src.ip();
                 let nid = self.resolve_neighbor(inb.iface, src_ip);
-                // Record heard time for freshness tracking.
-                self.heard_at.insert(nid, Instant::now());
 
                 // Learn prefix → RouterId mapping from the `from` field + self-pin entry.
                 // The self-pin entry has dest == msg.from; register it so snapshot can look up.
                 for entry in &msg.delta {
                     if entry.dest == msg.from {
-                        self.prefix_to_rid.entry(entry.prefix).or_insert_with(|| msg.from.clone());
+                        self.prefix_to_rid
+                            .entry(entry.prefix)
+                            .or_insert_with(|| msg.from.clone());
                     }
                 }
 
@@ -136,7 +128,8 @@ impl<T: Transport> Daemon<T> {
                 if dest_count >= MAX_DESTS {
                     tracing::debug!(
                         "dest table at {} entries, dropping inbound delta from {:?}",
-                        dest_count, msg.from
+                        dest_count,
+                        msg.from
                     );
                     return;
                 }
@@ -146,30 +139,6 @@ impl<T: Transport> Daemon<T> {
             }
             Err(e) => {
                 tracing::debug!("wire decode error: {}", e);
-            }
-        }
-    }
-
-    /// Drop neighbours silent for longer than `fresh` ticks.
-    fn sweep_stale(&mut self) {
-        let tick = self.cfg.cfg.tick;
-        let fresh = self.cfg.cfg.fresh;
-        // Use a slightly generous threshold (fresh + 1 tick) to avoid racing with slow ticks.
-        let stale_threshold = tick.mul_f64(fresh + 1.0);
-
-        let stale: Vec<NeighborId> = self
-            .heard_at
-            .iter()
-            .filter(|(_, t)| t.elapsed() > stale_threshold)
-            .map(|(&nid, _)| nid)
-            .collect();
-
-        for nid in stale {
-            tracing::debug!("dropping stale neighbor {:?}", nid);
-            self.engine.drop_neighbor(nid);
-            self.heard_at.remove(&nid);
-            if let Some(key) = self.addr_by_neighbor.remove(&nid) {
-                self.neighbor_by_addr.remove(&key);
             }
         }
     }
@@ -212,13 +181,12 @@ impl<T: Transport> Daemon<T> {
             .desired_routes(now)
             .filter(|r| r.routable)
             .filter_map(|r| {
-                self.prefix_to_rid.get(&r.prefix).map(|rid| (rid.clone(), r.prefix))
+                self.prefix_to_rid
+                    .get(&r.prefix)
+                    .map(|rid| (rid.clone(), r.prefix))
             })
             .collect();
-        tracing::debug!(
-            "RIB snapshot: {} routable dests",
-            routable.len()
-        );
+        tracing::debug!("RIB snapshot: {} routable dests", routable.len());
         RibSnapshot { routable }
     }
 
@@ -232,7 +200,10 @@ impl<T: Transport> Daemon<T> {
                     self.fib = Some(fib);
                 }
                 Err(e) => {
-                    tracing::warn!("fib: failed to open netlink ({}); running control-plane only", e);
+                    tracing::warn!(
+                        "fib: failed to open netlink ({}); running control-plane only",
+                        e
+                    );
                 }
             }
         } else {
@@ -251,7 +222,6 @@ impl<T: Transport> Daemon<T> {
                     let out = self.engine.step(now);
                     let encoded = wire::encode(&out.emit);
                     let _ = self.transport.send(&encoded).await;
-                    self.sweep_stale();
                     let snap = self.build_snapshot();
                     let _ = self.rib_tx.send(snap);
                     // FIB reconcile after each tick.
@@ -301,7 +271,10 @@ mod tests {
         cfg.tick = Duration::from_millis(tick_ms);
         DaemonConfig {
             router_id: RouterId(id.to_string()),
-            prefix: Prefix { addr: prefix_addr, len: 64 },
+            prefix: Prefix {
+                addr: prefix_addr,
+                len: 64,
+            },
             ifaces: vec![],
             cfg,
             policy: ForwardingPolicy::default(),

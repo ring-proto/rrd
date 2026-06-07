@@ -7,11 +7,16 @@ fn dead_source_severs_everywhere() {
     let n = 5;
     let mut fab = Fabric::line(n, cfg, 7);
     fab.run_ticks(300);
-    for d in 1..n { assert!(fab.is_routable(d, 0), "converged toward source 0"); }
-    fab.kill_node(0); // the source dies
-    fab.run_ticks(800); // STARTER; severance horizon ~ (1/phi-1)/alpha plus fresh + dwell
     for d in 1..n {
-        assert!(!fab.is_routable(d, 0), "node {d} must sever the dead source 0");
+        assert!(fab.is_routable(d, 0), "converged toward source 0");
+    }
+    fab.kill_node(0); // the source dies
+    fab.run_ticks(800); // STARTER; severance horizon ~ (1/phi-1)/alpha plus link-aging dwell
+    for d in 1..n {
+        assert!(
+            !fab.is_routable(d, 0),
+            "node {d} must sever the dead source 0"
+        );
     }
 }
 
@@ -43,6 +48,14 @@ fn retardation_is_necessary_no_retard_fails_to_sever() {
     // All 4 survivor nodes should still see node 0 as routable (reflection loop sustains V)
     let ablation_still_routable = (1..n).all(|d| ablation.is_routable(d, 0));
 
-    assert!(retarded_severed, "retarded fabric must sever the dead source within {} ticks", checkpoint_ticks);
-    assert!(ablation_still_routable, "no_retard must FAIL to sever within {} ticks (spurious resurrection, Thm 6.2)", checkpoint_ticks);
+    assert!(
+        retarded_severed,
+        "retarded fabric must sever the dead source within {} ticks",
+        checkpoint_ticks
+    );
+    assert!(
+        ablation_still_routable,
+        "no_retard must FAIL to sever within {} ticks (spurious resurrection, Thm 6.2)",
+        checkpoint_ticks
+    );
 }

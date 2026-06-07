@@ -6,7 +6,10 @@ use ring_core::{Config, Engine, ForwardingPolicy, Message, NeighborId, Prefix, R
 use std::net::Ipv6Addr;
 
 fn px(n: u16) -> Prefix {
-    Prefix { addr: Ipv6Addr::new(0xfd00, 0x7269, 0x6e67, n, 0, 0, 0, 0), len: 64 }
+    Prefix {
+        addr: Ipv6Addr::new(0xfd00, 0x7269, 0x6e67, n, 0, 0, 0, 0),
+        len: 64,
+    }
 }
 
 /// Centralized Gauss-Seidel solve of (L_g + Q) f = 0, destination `dst` pinned at F0.
@@ -96,7 +99,9 @@ impl SyncMesh {
 
 #[test]
 fn engine_field_matches_centralized_solver_on_a_line() {
-    let cfg = Config::default();
+    let mut cfg = Config::default();
+    // Exact static M-matrix oracle: raw conductances, no staleness sawtooth.
+    cfg.no_link_age = true;
     // 5-node line: 0-1-2-3-4, unit conductance. Destination = node 0.
     let edges = [(0, 1, 1.0), (1, 2, 1.0), (2, 3, 1.0), (3, 4, 1.0)];
     let n = 5;
@@ -123,7 +128,9 @@ fn engine_field_matches_centralized_solver_on_a_line() {
 
 #[test]
 fn engine_field_matches_centralized_solver_on_a_mesh() {
-    let cfg = Config::default();
+    let mut cfg = Config::default();
+    // Exact static M-matrix oracle: raw conductances, no staleness sawtooth.
+    cfg.no_link_age = true;
     // A small irregular mesh with a mixed-conductance edge.
     let edges = [
         (0, 1, 1.0),

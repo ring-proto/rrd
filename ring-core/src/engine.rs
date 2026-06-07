@@ -166,9 +166,17 @@ impl Engine {
     /// `Some` with `routable = false` and the direction still populated.
     pub fn route(&self, now: Mono, dest: &RouterId) -> Option<Route> {
         let &d = self.dest_slot.get(dest)?;
-        let v = age(self.cfg.alpha, self.vit[d], ticks_between(self.last_aged, now, self.cfg.tick));
+        let v = age(
+            self.cfg.alpha,
+            self.vit[d],
+            ticks_between(self.last_aged, now, self.cfg.tick),
+        );
         let known = self.f[d] >= self.cfg.floor && self.dominant[d].is_some();
-        Some(Route { via: self.dominant[d], vit: v, routable: known && v >= self.cfg.phi })
+        Some(Route {
+            via: self.dominant[d],
+            vit: v,
+            routable: known && v >= self.cfg.phi,
+        })
     }
 
     /// Return the dense slot for `key`, allocating (and growing every dense vector, including
@@ -199,14 +207,27 @@ impl Engine {
 
     pub fn step(&mut self, now: Mono) -> StepOutput {
         self.age_all(now);
-        self.charge = reg(self.charge, self.cfg.crowd * (self.load + self.stress), self.cfg.glide);
+        self.charge = reg(
+            self.charge,
+            self.cfg.crowd * (self.load + self.stress),
+            self.cfg.glide,
+        );
 
         let bidir: Vec<NeighborId> = self.bidir(now);
-        let gsum: f64 = bidir.iter().map(|n| self.neighbors[n].g).sum();
+        let geff: Vec<f64> = bidir
+            .iter()
+            .map(|n| self.peer_conductance(&self.neighbors[n], now))
+            .collect();
+        let gsum: f64 = geff.iter().sum();
 
         let ndest = self.ndest();
         let mut delta: Vec<Entry> = Vec::with_capacity(ndest);
-        delta.push(Entry { dest: self.id.clone(), prefix: self.prefix, pot: self.cfg.f0, vit: 1.0 });
+        delta.push(Entry {
+            dest: self.id.clone(),
+            prefix: self.prefix,
+            pot: self.cfg.f0,
+            vit: 1.0,
+        });
         let mut carried = 0.0;
 
         if gsum > 0.0 {
@@ -214,9 +235,9 @@ impl Engine {
             for v in self.fbuf.iter_mut() {
                 *v = 0.0;
             }
-            for n in &bidir {
+            for (k, n) in bidir.iter().enumerate() {
                 let p = &self.neighbors[n];
-                let g = p.g;
+                let g = geff[k];
                 for d in 0..ndest {
                     self.fbuf[d] += g * p.pot[d];
                 }
@@ -233,9 +254,9 @@ impl Engine {
                 self.hops[d].clear();
                 let mut best = 0.0;
                 let mut bvia = None;
-                for n in &bidir {
+                for (k, n) in bidir.iter().enumerate() {
                     let p = &self.neighbors[n];
-                    let w = p.g * (p.pot[d] - fd);
+                    let w = geff[k] * (p.pot[d] - fd);
                     if w > 0.0 {
                         self.hops[d].push(WeightedHop { via: *n, weight: w });
                     }
@@ -266,7 +287,11 @@ impl Engine {
         self.load = carried;
 
         StepOutput {
-            emit: Message { from: self.id.clone(), hears: self.heard_list(now), delta },
+            emit: Message {
+                from: self.id.clone(),
+                hears: self.heard_list(now),
+                delta,
+            },
         }
     }
 
@@ -309,11 +334,13 @@ impl Engine {
         self.last_aged = now;
     }
 
-    /// Bidirectional, fresh neighbours (the only ones that contribute to relaxation / forwarding).
-    fn bidir(&self, now: Mono) -> Vec<NeighborId> {
+    /// Bidirectional neighbours. Staleness is not a hard gate here: a silent
+    /// peer's advertised potentials lose influence through reciprocal
+    /// conductance aging in `step()`.
+    fn bidir(&self, _now: Mono) -> Vec<NeighborId> {
         let mut out = Vec::new();
         for (id, p) in &self.neighbors {
-            if p.hears && ticks_between(p.heard, now, self.cfg.tick) < self.cfg.fresh {
+            if p.hears {
                 out.push(*id);
             }
         }
@@ -321,18 +348,27 @@ impl Engine {
         out
     }
 
-    /// The neighbours we currently hear (freshness only — ONE-WAY, regardless of `hears`) — the
-    /// `Hears` echo we advertise. This is intentionally distinct from `bidir`, which additionally
-    /// requires the two-way `hears` flag for relaxation/forwarding.
+    fn peer_conductance(&self, p: &Peer, now: Mono) -> f64 {
+        if self.cfg.no_link_age {
+            return p.g;
+        }
+        let stale_ticks = ticks_between(p.heard, now, self.cfg.tick);
+        age(self.cfg.alpha, p.g, stale_ticks)
+    }
+
+    /// The neighbours we currently hear (ONE-WAY, regardless of `hears`) — the
+    /// `Hears` echo we advertise. A long-silent neighbour drops out of the echo
+    /// only once its aged conductance is numerically negligible.
     fn heard_list(&self, now: Mono) -> Vec<RouterId> {
         let mut out = Vec::new();
         for p in self.neighbors.values() {
             if let Some(id) = &p.id {
-                if ticks_between(p.heard, now, self.cfg.tick) < self.cfg.fresh {
+                if self.peer_conductance(p, now) > self.cfg.floor {
                     out.push(id.clone());
                 }
             }
         }
+        out.sort_by(|a, b| a.0.cmp(&b.0));
         out
     }
 }
@@ -346,11 +382,14 @@ mod tests {
     use std::time::Duration;
 
     fn px(n: u16) -> Prefix {
-        Prefix { addr: Ipv6Addr::new(0xfd00, 0x7269, 0x6e67, n, 0, 0, 0, 0), len: 64 }
+        Prefix {
+            addr: Ipv6Addr::new(0xfd00, 0x7269, 0x6e67, n, 0, 0, 0, 0),
+            len: 64,
+        }
     }
 
     #[test]
-    fn fresh_engine_emits_only_self_pin() {
+    fn new_engine_emits_only_self_pin() {
         let cfg = Config::default();
         let mut e = Engine::new(RouterId::from("a"), px(1), cfg, Default::default());
         let out = e.step(Duration::ZERO);
@@ -372,7 +411,12 @@ mod tests {
         let msg = Message {
             from: RouterId::from("b"),
             hears: vec![RouterId::from("a")],
-            delta: vec![Entry { dest: RouterId::from("b"), prefix: px(2), pot: cfg.f0, vit: 1.0 }],
+            delta: vec![Entry {
+                dest: RouterId::from("b"),
+                prefix: px(2),
+                pot: cfg.f0,
+                vit: 1.0,
+            }],
         };
         a.ingest(Duration::ZERO, NeighborId(1), &msg);
         // Vitality toward b is adopted aged by one tick of transit: 1/(1+α).
@@ -390,7 +434,12 @@ mod tests {
         let msg = Message {
             from: RouterId::from("b"),
             hears: vec![RouterId::from("a")],
-            delta: vec![Entry { dest: RouterId::from("b"), prefix: px(2), pot: 1.0, vit: 1.0 }],
+            delta: vec![Entry {
+                dest: RouterId::from("b"),
+                prefix: px(2),
+                pot: 1.0,
+                vit: 1.0,
+            }],
         };
         a.ingest(Duration::ZERO, NeighborId(1), &msg);
         // un-retarded: adopted raw at 1.0 (the spurious-resurrection mechanism, Thm 6.2).
@@ -402,11 +451,20 @@ mod tests {
         let cfg = Config::default();
         let mut a = Engine::new(RouterId::from("a"), px(1), cfg, Default::default());
         a.add_neighbor(NeighborId(1));
-        // B does NOT list A in Hears yet → one-way; A still echoes hearing B (one-way freshness).
-        let one_way = Message { from: RouterId::from("b"), hears: vec![], delta: vec![] };
+        // B does NOT list A in Hears yet → one-way; A still echoes hearing B.
+        let one_way = Message {
+            from: RouterId::from("b"),
+            hears: vec![],
+            delta: vec![],
+        };
         a.ingest(Duration::ZERO, NeighborId(1), &one_way);
-        assert!(a.step(Duration::ZERO).emit.hears.contains(&RouterId::from("b")),
-                "A hears B (one-way) and should echo it");
+        assert!(
+            a.step(Duration::ZERO)
+                .emit
+                .hears
+                .contains(&RouterId::from("b")),
+            "A hears B (one-way) and should echo it"
+        );
     }
 
     /// Feed A a steady advertisement from neighbour B (the destination, pinning F0 and hearing A).
@@ -424,7 +482,12 @@ mod tests {
         let b_msg = Message {
             from: RouterId::from("b"),
             hears: vec![RouterId::from("a")],
-            delta: vec![Entry { dest: RouterId::from("b"), prefix: px(2), pot: cfg.f0, vit: 1.0 }],
+            delta: vec![Entry {
+                dest: RouterId::from("b"),
+                prefix: px(2),
+                pot: cfg.f0,
+                vit: 1.0,
+            }],
         };
 
         // Drive a few rounds: ingest B's advert, then step, advancing time by one tick each round.
@@ -441,7 +504,10 @@ mod tests {
 
         let route = a.route(tick * 5, &RouterId::from("b")).unwrap();
         assert_eq!(route.via, Some(NeighborId(1)));
-        assert!(route.routable, "V≈0.93 ≥ φ=0.5 and f≈0.95 ≥ floor ⇒ routable");
+        assert!(
+            route.routable,
+            "V≈0.93 ≥ φ=0.5 and f≈0.95 ≥ floor ⇒ routable"
+        );
     }
 
     /// Two neighbours advertise the SAME potential toward d, but over links of different
@@ -461,7 +527,12 @@ mod tests {
         let mk = |from: &str| Message {
             from: RouterId::from(from),
             hears: vec![RouterId::from("a")],
-            delta: vec![Entry { dest: RouterId::from("d"), prefix: px(9), pot: 0.9, vit: 1.0 }],
+            delta: vec![Entry {
+                dest: RouterId::from("d"),
+                prefix: px(9),
+                pot: 0.9,
+                vit: 1.0,
+            }],
         };
         for k in 0..3u32 {
             let now = cfg.tick * k;
@@ -475,7 +546,10 @@ mod tests {
         // dominant (first, after descending sort) is the fat link N2
         assert_eq!(hops[0].via, NeighborId(2));
         assert!(hops[0].weight > hops[1].weight, "fat link dominates");
-        assert_eq!(a.route(cfg.tick * 3, &RouterId::from("d")).unwrap().via, Some(NeighborId(2)));
+        assert_eq!(
+            a.route(cfg.tick * 3, &RouterId::from("d")).unwrap().via,
+            Some(NeighborId(2))
+        );
     }
 
     #[test]
@@ -487,7 +561,12 @@ mod tests {
         let mk = |from: &str| Message {
             from: RouterId::from(from),
             hears: vec![RouterId::from("a")],
-            delta: vec![Entry { dest: RouterId::from("d"), prefix: px(9), pot: 0.9, vit: 1.0 }],
+            delta: vec![Entry {
+                dest: RouterId::from("d"),
+                prefix: px(9),
+                pot: 0.9,
+                vit: 1.0,
+            }],
         };
         for k in 0..3u32 {
             let now = cfg.tick * k;
@@ -496,7 +575,10 @@ mod tests {
             a.step(now);
         }
         let routes: Vec<_> = a.desired_routes(cfg.tick * 3).collect();
-        let d = routes.iter().find(|r| r.prefix == px(9)).expect("d present");
+        let d = routes
+            .iter()
+            .find(|r| r.prefix == px(9))
+            .expect("d present");
         assert!(d.routable);
         assert_eq!(d.nexthops.len(), 1, "max_paths default = 1");
         // self is never a desired route
@@ -512,21 +594,33 @@ mod tests {
         let msg = Message {
             from: RouterId::from("n1"),
             hears: vec![RouterId::from("a")],
-            delta: vec![Entry { dest: RouterId::from("d"), prefix: px(9), pot: 0.9, vit: 1.0 }],
+            delta: vec![Entry {
+                dest: RouterId::from("d"),
+                prefix: px(9),
+                pot: 0.9,
+                vit: 1.0,
+            }],
         };
         for k in 0..3u32 {
             let now = cfg.tick * k;
             a.ingest(now, NeighborId(1), &msg);
             a.step(now);
         }
-        assert!(a.route(cfg.tick * 3, &RouterId::from("d")).unwrap().routable);
+        assert!(
+            a.route(cfg.tick * 3, &RouterId::from("d"))
+                .unwrap()
+                .routable
+        );
 
         // No more ingest: vitality ages toward 0. Far past the horizon R_V=(1/φ−1)/α the read
         // drops below φ.
         let far = cfg.tick * 5000;
         let r = a.route(far, &RouterId::from("d")).unwrap();
         assert!(!r.routable, "should sever once V < φ (V={})", r.vit);
-        assert!(r.via.is_some(), "direction is still known — severance is not deletion");
+        assert!(
+            r.via.is_some(),
+            "direction is still known — severance is not deletion"
+        );
     }
 
     #[test]

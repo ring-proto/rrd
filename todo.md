@@ -4,15 +4,15 @@ Source: the 6-way codebase audit (2026-06-07) + per-milestone review findings. F
 `- [ ] **title** — \`location\` — impact. *fix:* …`. Severity-ordered; see **Biggest levers**
 at the bottom for suggested work order.
 
-> Protocol-level design questions (e.g. the `Fresh` window's binary-threshold vs.
-> continuous-conductance-decay form) are being handled separately in the theory / math /
-> paper / Go reference — see **Owned elsewhere**. Implementation warts stay below.
+> Fidelity target: no protocol parameter or code path named around link recency windows.
+> Silent links age by reciprocal conductance with `β=α`; pruning/GC must remain non-load-bearing.
 
 ---
 
 ## ✅ Resolved this session
 - [x] **Rootless netns lab/demo (no sudo)** — PID-based namespaces in one userns; `bash harness/demo.sh` passes end to end.
 - [x] **FIB proto query false-FAIL on a clean box** — demo asserted `proto ring` (needs a host `rt_protos.d` file); now filters numeric `proto 155` (robust) and ships `make install-rtproto` for the display name.
+- [x] **Ported reciprocal link-aging foundation from `ring`** — stale links age as `g_eff = g/(1+αkg)` with `β=α`, and a no-link-aging ablation test demonstrates the dead-relay pin.
 
 ---
 
@@ -38,7 +38,7 @@ at the bottom for suggested work order.
 
 - [ ] **13. FIB reconcile every tick, no rate-limit/hysteresis** — `rrd/src/runtime.rs:257`, `fib.rs:64` — steady state issues 0 ops, but a near-tie/flapping dominant nexthop can thrash install/withdraw; `build_route_intents` + `build_snapshot` each iterate `desired_routes` separately. *fix:* reconcile only on change (dirty flag/hash), hysteresis via `weight_quantum`, compute `desired_routes` once/tick.
 - [ ] **14. FIB reconcile awaited inline blocks the `select!` loop** — `rrd/src/runtime.rs:248` — slow/blocked netlink stalls `transport.recv()` → can spuriously age out neighbours; the spec's separate `fib_task` was collapsed inline. *fix:* move reconcile to its own task fed by the watch channel.
-- [ ] **15. When the dest cap trips, the entire inbound delta is dropped** — `rrd/src/runtime.rs:134` — drops a legit neighbour's self-pin + refreshes wholesale → connectivity loss for honest traffic. *fix:* still ingest already-known dests; reject only *new* transit interns.
+- [ ] **15. When the dest cap trips, the entire inbound delta is dropped** — `rrd/src/runtime.rs:134` — drops a legit neighbour's self-pin + self-advert wholesale → connectivity loss for honest traffic. *fix:* still ingest already-known dests; reject only *new* transit interns.
 - [ ] **16. Oversized `Message` > MTU: silent RX truncation / TX `EMSGSIZE`, no segmentation** — `rrd/src/udp.rs:31,150,201` — `step()` emits one entry/dest uncapped; beyond ~150 dests a datagram exceeds the 8192 buffer → TX aborts (swallowed), RX truncates → decode rejects whole frame. Protocol silently wedges as the dest table grows. *fix:* segment the delta or cap+log in `step()`/`encode()`; size RX buffer to MTU + detect `MSG_TRUNC`.
 - [ ] **17. `wire::encode_str` silently truncates strings >255B (can split a UTF-8 codepoint)** — `rrd/src/wire.rs:91` — a cut mid-codepoint emits invalid UTF-8 → peers reject the whole frame (incl. self-pin) → node silently unroutable; `hears`/`delta` counts likewise silently capped. *fix:* validate id length at config load, make `encode` fallible; if capping, cut on a char boundary + log.
 - [ ] **18. `decode` accepts arbitrarily large finite `pot`; no F0 bound** — `rrd/src/wire.rs:148`, `engine.rs:221` — a liar inflates `fd` into a false global maximum → gradient hijack (sink/black-hole). *fix:* clamp/reject advertised `pot ≤ F0` at decode/ingest.
@@ -47,12 +47,12 @@ at the bottom for suggested work order.
 - [ ] **21. `withdraw_all` skipped on panic → netlink routes leak in the kernel** — `rrd/src/runtime.rs:281`, `fib.rs:132` — a panic in the run task leaves proto-155 routes blackholing until manual flush; no timeout on per-prefix delete. *fix:* panic-hook / Drop-based flush of proto-155 + bounded deletes.
 - [ ] **22. Severance test asserts a transient 40-tick checkpoint; `no_retard` never demonstrates Thm 6.2** — `ring-sim/tests/severance.rs` — `no_retard` decays monotonically (because `age_all` ages V every step regardless of the flag) and only *delays* severance ~4×; the test passes by sampling inside the timing gap. *fix:* either make `no_retard` truly sustain V≥φ then assert the asymptotic fixed point at large t, or rename to "retardation accelerates severance ~4×" and assert each measured severance tick.
 - [ ] **23. Acyclicity test samples one post-settle instant; transient loops / `BlackholeLoop` untested** — `ring-sim/tests/loops.rs:32`, `dataplane.rs:61` — equilibrium via-graph is acyclic by construction (near-tautological); transient micro-loops during reconvergence (what `BlackholeLoop` models) never exercised. *fix:* forward packets during the churn window, assert no *persisting* `BlackholeLoop`, sample several mid-reconvergence instants.
-- [ ] **24. Daemon freshness uses wall-clock `Instant` separate from the engine's injected `Mono` clock** — `rrd/src/runtime.rs:124,154`, `engine.rs:316` — `sweep_stale` uses a parallel `heard_at` + threshold `fresh+1`, so the two can disagree at expiry (engine relaxes over a peer the daemon dropped, or vice-versa); `now()` recomputed 3–4×/tick so the `V≥φ` gate can resolve differently within one tick. *fix:* drive sweep from the same injected `Mono now()`, align the threshold to `cfg.fresh`, capture `now` once/tick. *(implementation wart of the single protocol `Fresh` window — distinct from the protocol-level `Fresh` question owned elsewhere.)*
+- [ ] **24. Daemon/engine pruning is now policy-less after recency-window removal** — `rrd/src/runtime.rs`, `ring-core/src/engine.rs` — the field correctly fades stale links by reciprocal conductance, but the daemon currently keeps neighbour/prefix slots until process exit. *fix:* add non-load-bearing pruning once `g_eff<floor` for a dwell and no route depends on the peer; tie it into reach-ball GC rather than creating a correctness gate.
 - [ ] **25. `now() = tick*1000 + elapsed` forces ~1000 ticks of aging on the first engine call** — `rrd/src/runtime.rs:27`, `engine.rs:64` — benign only because all vit start at 0 and `age()` is inert on v≤0; a foot-gun if any future path seeds non-zero vitality pre-first-step. *fix:* anchor `last_aged` at `base_offset` (or drop `base_offset`).
-- [ ] **26. `heard_list` emits the `Hears` echo in HashMap iteration order → wire nondeterminism** — `ring-core/src/engine.rs:327` — unlike `bidir()` it doesn't sort, so emitted frame bytes differ run-to-run (breaks "reproducible from a seed" for golden-frame/pcap diffs). Routing unaffected. *fix:* sort `heard_list` output.
+- [x] **26. `heard_list` emits the `Hears` echo in deterministic order** — `ring-core/src/engine.rs` — sorted by `RouterId` as part of the link-aging port so emitted frame bytes are reproducible across HashMap iteration order.
 - [ ] **27. Hot-path allocations: `bidir`/`heard_list`/`delta` reallocated every step** — `ring-core/src/engine.rs:204,313` — `fbuf` is reused but these aren't (Go reuses scratch), contradicting the documented allocation-free hot loop; dominant under dest inflation. *fix:* persistent scratch Vecs cleared+refilled each step.
 - [ ] **28. `MemTransport` tags RX with the sender's iface, not the receiver's** — `rrd/src/transport.rs:112` vs `udp.rs:177` — the two transports attach semantically different ifindexes; tests can bake in the wrong invariant, a multi-iface mem topology mis-resolves FIB oif. *fix:* stamp the receiver's iface on `recv` to match the UDP contract.
-- [ ] **29. `cut_link`/`kill` don't recall in-flight messages** — `ring-sim/src/fabric.rs:211` — `do_deliver` re-checks only `nodes[to].up`, never `link.up`, so one post-cut stale advert still delivers (+1 tick apparent liveness across a fresh cut). Masked by wide test horizons. *fix:* re-check `links[a.link].up` in `do_deliver`, or document + budget the +1 tick.
+- [ ] **29. `cut_link`/`kill` don't recall in-flight messages** — `ring-sim/src/fabric.rs:211` — `do_deliver` re-checks only `nodes[to].up`, never `link.up`, so one post-cut stale advert still delivers (+1 tick apparent liveness across a new cut). Masked by wide test horizons. *fix:* re-check `links[a.link].up` in `do_deliver`, or document + budget the +1 tick.
 - [ ] **30. Demo hardwired to N=3, under-covers failure modes** — `harness/demo.sh`, `lab.sh:179` — waits/targets/substring matches tuned for 3 nodes (`fd00:a2` matches `fd00:a20…` at N≥21); never exercises loss, N>3 fan-out, reconvergence storms, node death, partition/merge. *fix:* scale waits w/ hop count, validate adjacency, anchor route matches; add `tc netem` loss/delay + a storm scenario, or document as explicit M3 non-goals.
 - [ ] **31. `lab_up` has no host-veth collision guard** — `harness/lab.sh:101` — create doesn't check `veth<N>{a,b}` names are free; on a host already using that pattern, a later `lab_down` could collateral-delete an unrelated host veth. *fix:* assert names free or use a lab-unique prefix; `set -o pipefail` + check exit status.
 
@@ -77,7 +77,7 @@ at the bottom for suggested work order.
 5. **Harness reproducibility** — proto-155 ✅ done; remaining #10 (lab.sh trap, basename pkill), #30 (scale-aware), #31 (collision guard).
 
 ## Owned elsewhere (theory / math / paper / Go ref — not rrd code)
-- **`Fresh` window: binary threshold vs. continuous-conductance-decay.** Whether link-liveness should stay a hard fresh/stale window or be reformulated as a smooth decay of edge conductance `g` with time-since-heard (making it field-native and symmetric with vitality aging). The rrd *implementation* freshness wart (#24) is separate and stays above.
+- *(Cleared for the link-aging question.)* Stale routing evidence ages as reciprocal link conductance with `β=α`. rrd has ported the core behaviour, with pruning/GC still tracked above as implementation policy.
 
 ## Known-and-fine-to-defer (acknowledged PoC scope)
 Unauthenticated on-link control plane (spec §7); single-path FIB / `max_paths=1`; measured conductance & transit (hardcoded `transit=1.0`, uniform `g=cfg.d`); hierarchy/landmarks/reach-ball scoping; eBPF/XDP data plane; CNI plugin; congestion hooks present but `crowd=0` with no `--crowd` flag. *(Defer the features — but #1/#2 GC and the input-validation budget should land regardless, since they're what make the deferred gaps exploitable.)*
