@@ -109,6 +109,13 @@ impl FibReconciler {
                 Ok(()) => {
                     self.installed.remove(&prefix);
                 }
+                Err(e) if is_already_gone(&e) => {
+                    // The kernel already removed this route (e.g. its link went
+                    // down and the route was flushed).  The desired state — route
+                    // absent — is satisfied, so drop our bookkeeping instead of
+                    // retrying the delete forever.
+                    self.installed.remove(&prefix);
+                }
                 Err(e) => {
                     tracing::warn!(
                         "fib: failed to withdraw {}/{}: {}",
@@ -128,6 +135,9 @@ impl FibReconciler {
             tracing::info!("fib: withdraw_all {}/{}", prefix.addr, prefix.len);
             match self.delete_route(&prefix).await {
                 Ok(()) => {
+                    self.installed.remove(&prefix);
+                }
+                Err(e) if is_already_gone(&e) => {
                     self.installed.remove(&prefix);
                 }
                 Err(e) => {
@@ -170,6 +180,21 @@ impl FibReconciler {
             .execute()
             .await
     }
+}
+
+/// Whether a netlink delete error means the route is *already absent* — i.e.
+/// the desired state (route gone) is already satisfied and we should stop
+/// retrying.  The kernel returns `ESRCH` (3) or `ENOENT` (2) when asked to
+/// delete a route it no longer has (e.g. it was flushed when its link went
+/// down).  Any other error is a genuine failure worth retrying/logging.
+fn is_already_gone(err: &rtnetlink::Error) -> bool {
+    if let rtnetlink::Error::NetlinkError(msg) = err {
+        let errno = msg.to_io().raw_os_error().unwrap_or(0);
+        // ESRCH = 3, ENOENT = 2 on Linux.
+        return errno == nix::errno::Errno::ESRCH as i32
+            || errno == nix::errno::Errno::ENOENT as i32;
+    }
+    false
 }
 
 /// Remove the `RouteAttribute::Gateway` attribute from a `RouteMessage` and

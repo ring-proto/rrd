@@ -82,8 +82,26 @@ fn make_socket(ifindex: u32) -> io::Result<UdpSocket> {
     sock.set_reuse_address(true)?;
     sock.set_reuse_port(true)?;
 
-    // Bind to [::]:PORT.  We use scope_id=0 here; the kernel routes per socket
-    // based on the interface we set with set_multicast_if_v6.
+    // Bind the socket to THIS interface (SO_BINDTODEVICE).  This is essential
+    // on a multi-interface node: without it, every per-iface socket binds to
+    // the wildcard [::]:PORT in the same SO_REUSEPORT group, and the kernel
+    // delivers an inbound multicast datagram to an *arbitrary* socket in that
+    // group — so the static ifindex tag attached by the owning reader task can
+    // be wrong.  A wrong ifindex makes the daemon resolve the neighbour's
+    // (iface, fe80::) locator to the wrong output interface, and the installed
+    // FIB route points out the wrong veth (unroutable).  Binding to the device
+    // constrains both RX and TX to that interface, so the ifindex tag is always
+    // correct.  We resolve the ifindex to a name for SO_BINDTODEVICE.
+    let ifname = nix::net::if_::if_indextoname(ifindex).map_err(|e| {
+        io::Error::new(
+            io::ErrorKind::Other,
+            format!("if_indextoname({}) failed: {}", ifindex, e),
+        )
+    })?;
+    sock.bind_device(Some(ifname.as_bytes()))?;
+
+    // Bind to [::]:PORT.  Combined with SO_BINDTODEVICE above, the socket only
+    // receives datagrams arriving on `ifindex`.
     let bind_addr = SocketAddrV6::new(Ipv6Addr::UNSPECIFIED, PORT, 0, 0);
     sock.bind(&SockAddr::from(bind_addr))?;
 
@@ -109,35 +127,65 @@ fn make_socket(ifindex: u32) -> io::Result<UdpSocket> {
     UdpSocket::from_std(std_udp)
 }
 
+/// Period between idempotent multicast re-joins (see `reader_task`).
+const REJOIN_PERIOD: std::time::Duration = std::time::Duration::from_secs(1);
+
+/// Re-join [`RING_GROUP`] on `ifindex` for the socket behind `sock`.
+///
+/// When a veth link goes down and back up (a cut/heal), the kernel silently
+/// drops the socket's IPv6 multicast group membership and does NOT restore it
+/// on link-up.  The socket then stops receiving RING multicast even though the
+/// frames are visible on the wire, so the node never re-learns routes after a
+/// heal.  We periodically re-issue the join; an "already a member" error in
+/// steady state is expected and ignored, while after a flap the join genuinely
+/// re-establishes membership.
+fn rejoin_group(sock: &UdpSocket, ifindex: u32) {
+    let sref = socket2::SockRef::from(sock);
+    // Ignore the EADDRINUSE/"already joined" case in steady state.
+    let _ = sref.join_multicast_v6(&RING_GROUP, ifindex);
+}
+
 /// Per-socket reader task: reads datagrams from `sock` and forwards them to `tx`.
+///
+/// Also re-joins the multicast group every [`REJOIN_PERIOD`] so membership
+/// survives a link flap (cut/heal).
 async fn reader_task(sock: UdpSocket, ifindex: u32, tx: mpsc::Sender<Inbound>) {
     let mut buf = vec![0u8; MAX_DGRAM];
+    let mut rejoin = tokio::time::interval(REJOIN_PERIOD);
+    rejoin.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    // The first tick fires immediately; skip it (we just joined in make_socket).
+    rejoin.tick().await;
     loop {
-        match sock.recv_from(&mut buf).await {
-            Ok((len, src_addr)) => {
-                // Extract IPv6 source address; drop non-v6 (shouldn't happen on
-                // an IPv6-only socket but be defensive).
-                let src = match src_addr {
-                    std::net::SocketAddr::V6(v6) => v6,
-                    std::net::SocketAddr::V4(_) => continue,
-                };
-
-                let inbound = Inbound {
-                    iface: ifindex,
-                    src,
-                    data: buf[..len].to_vec(),
-                };
-
-                // If the receiver side has been dropped, stop the task.
-                if tx.send(inbound).await.is_err() {
+        let (len, src_addr) = tokio::select! {
+            _ = rejoin.tick() => {
+                rejoin_group(&sock, ifindex);
+                continue;
+            }
+            r = sock.recv_from(&mut buf) => match r {
+                Ok(pair) => pair,
+                Err(e) => {
+                    tracing::error!("Udp6Transport reader[iface={}]: {}", ifindex, e);
                     break;
                 }
-            }
-            Err(e) => {
-                // Log and stop on fatal socket errors.
-                tracing::error!("Udp6Transport reader[iface={}]: {}", ifindex, e);
-                break;
-            }
+            },
+        };
+
+        // Extract IPv6 source address; drop non-v6 (shouldn't happen on
+        // an IPv6-only socket but be defensive).
+        let src = match src_addr {
+            std::net::SocketAddr::V6(v6) => v6,
+            std::net::SocketAddr::V4(_) => continue,
+        };
+
+        let inbound = Inbound {
+            iface: ifindex,
+            src,
+            data: buf[..len].to_vec(),
+        };
+
+        // If the receiver side has been dropped, stop the task.
+        if tx.send(inbound).await.is_err() {
+            break;
         }
     }
 }
