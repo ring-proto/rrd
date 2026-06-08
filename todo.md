@@ -15,6 +15,7 @@ at the bottom for suggested work order.
 - [x] **Ported reciprocal link-aging foundation from `ring`** — stale links age as `g_eff = g/(1+αkg)` with `β=α`, and a no-link-aging ablation test demonstrates the dead-relay pin.
 - [x] **Weighted ECMP multipath end-to-end** — see #9 (closed).
 - [x] **CNI integration (PoC)** — `rrd-cni` (CNI 1.1.0 plugin) + `rrd-agent` (lifecycle agent on `/run/rrd/agent.sock`) + `rrd/src/control.rs` (daemon control socket) + dynamic local origins in the engine/runtime; `deploy/` for rke2/flannel. The rootless demo exercises a dynamic `/128` origin install → ping → withdraw → sever live.
+- [x] **Workspace clippy gate restored** — `cargo clippy --workspace --all-targets -- -D warnings` is clean again (was dirty under clippy 0.1.96 with `field_reassign_with_default`/`needless_range_loop` in test code only); fixed via struct-literal init + `.enumerate()`, no blanket allows, all 225 tests still green.
 
 ---
 
