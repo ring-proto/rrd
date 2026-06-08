@@ -44,7 +44,7 @@ RRD_BIN="${RRD_BIN:-${REPO_ROOT}/target/release/rrd}"
 # ── Tunables (widen waits here if a stage is flaky) ──────────────────────────
 CONVERGE_TIMEOUT=10     # seconds to wait for initial route install
 SEVER_WAIT=4            # seconds to wait for a cut to propagate (withdraw)
-HEAL_WAIT=6             # seconds to wait for a heal to reconverge
+HEAL_WAIT=12            # seconds to wait for a heal to reconverge (includes up to ~1s multicast re-join after the link flap)
 PING_COUNT=3            # echo requests per ping probe
 PING_W=1                # per-packet ping timeout (s)
 NODES=3                 # line length (ring0 … ring(NODES-1))
@@ -157,6 +157,28 @@ ping_ok() {
     [ -n "$recv" ] && [ "$recv" -ge $((PING_COUNT - 1)) ]
 }
 
+# wait_ping <node> <dst> <timeout_s> : retry the ping until it delivers or the
+# deadline passes. A successful ping inherently requires BOTH the forward route
+# (sender→dst) and the reverse route (dst→sender, for echo replies) to be up, so
+# polling the ping itself is a stronger readiness check than waiting on one route —
+# it also absorbs the brief dataplane settle after a route (re)appears. Used for the
+# "expected to succeed" probes; the "expected to fail" probes use ping_ok directly so
+# they fail fast.
+wait_ping() {
+    local node="$1" dst="$2" timeout="$3"
+    local deadline=$((SECONDS + timeout)) out recv
+    while [ "$SECONDS" -lt "$deadline" ]; do
+        out="$(nsx "$node" ping6 -c "$PING_COUNT" -W "$PING_W" "$dst" 2>&1)"
+        recv="$(echo "$out" | grep -oE '[0-9]+ received' | grep -oE '^[0-9]+')"
+        if [ -n "$recv" ] && [ "$recv" -ge $((PING_COUNT - 1)) ]; then
+            echo "$out"
+            return 0
+        fi
+    done
+    echo "$out" # last attempt, for diagnostics
+    return 1
+}
+
 # ── Run ──────────────────────────────────────────────────────────────────────
 
 note "lab_up ${NODES}  (ring0 — ring1 — ring2)  [rootless: PID-based netns]"
@@ -187,7 +209,7 @@ else
 fi
 
 note "ASSERT 2 — 2-hop ping ring0 -> ring2 ($DST2) [THE MILESTONE]"
-if ping_ok 0 "$DST2"; then
+if wait_ping 0 "$DST2" "$CONVERGE_TIMEOUT"; then
     pass "2-hop ping delivered — RING routed real packets through ring1"
     CORE_OK=1
 else
@@ -206,7 +228,7 @@ fi
 echo "--- ring0: dynamic-origin routes ---"
 lab_route_table 0
 echo "--- dynamic-origin ping ring0 -> $DYN_ADDR ---"
-if ping_ok 0 "$DYN_ADDR"; then
+if wait_ping 0 "$DYN_ADDR" "$CONVERGE_TIMEOUT"; then
     pass "dynamic /128 ping delivered through RRD"
 else
     fail "dynamic /128 ping did not deliver"
@@ -249,7 +271,7 @@ else
     fail "ring0's route to $DST2_PFX did not return after the heal"
 fi
 echo "--- post-heal ping (expected to SUCCEED) ---"
-if ping_ok 0 "$DST2"; then
+if wait_ping 0 "$DST2" "$HEAL_WAIT"; then
     pass "2-hop ping delivers again after the heal"
 else
     fail "ping does not deliver after the heal"
