@@ -10,8 +10,11 @@ use std::time::Duration;
 pub enum Event {
     /// Node runs one relax-and-emit on its own clock.
     Emit { node: usize },
-    /// A message arrives at `to` from neighbour `from`.
-    Deliver { to: usize, from: NeighborId, msg: Message },
+    /// A message arrives at `to` from neighbour `from`, having traversed link `link`.
+    /// `link` is carried so [`crate::fabric::Fabric::do_deliver`] can drop an in-flight
+    /// message whose link was cut while it was in transit (#29): a cut must take effect
+    /// the instant it is applied, not one delivery later.
+    Deliver { to: usize, from: NeighborId, link: usize, msg: Message },
 }
 
 /// An event stamped with its fire time and an insertion sequence number (the tie-break).

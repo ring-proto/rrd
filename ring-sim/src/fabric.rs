@@ -64,6 +64,16 @@ pub struct Fabric {
 }
 
 fn node_prefix(i: usize) -> Prefix {
+    // #36: the node index occupies a single IPv6 hextet (the 4th group). `i + 1` must fit in 16
+    // bits or the `as u16` truncation would silently alias two distinct nodes onto one prefix
+    // (e.g. node 0 and node 65536 both → ...:1::). Assert loudly instead. A wider sim would need a
+    // wider encoding (e.g. spilling into a second hextet), but the sims here are << 65535 nodes.
+    // `i + 1` must fit in a u16, i.e. `i + 1 <= 0xffff`, equivalently `i < 0xffff`.
+    assert!(
+        i < 0xffff,
+        "node index {i} overflows the IPv6 prefix hextet (max {} nodes); widen node_prefix encoding",
+        0xffffusize
+    );
     Prefix { addr: Ipv6Addr::new(0xfd00, 0x7269, 0x6e67, (i + 1) as u16, 0, 0, 0, 0), len: 64 }
 }
 
@@ -79,6 +89,27 @@ impl Fabric {
                 "LinkSpec[{}] has invalid conductance g={} (must be finite and > 0)",
                 i,
                 ls.g
+            );
+            // #37 invariant guard: the sim aliases each `Deliver`'s `from` to the emitting node's
+            // GLOBAL index, and `do_deliver` looks the link up by that same index. This is sound
+            // ONLY because every engine keys its neighbours by global node index AND at most one
+            // link wires any unordered pair {a,b}. A second (parallel) link between the same pair
+            // would make the (node-index → neighbour) handle ambiguous and could mis-attribute or
+            // mis-drop a message, so reject it at build time rather than mis-deliver silently.
+            assert!(
+                ls.a != ls.b,
+                "LinkSpec[{}] is a self-loop ({}-{}); the sim does not model self-links",
+                i,
+                ls.a,
+                ls.b
+            );
+            assert!(
+                !links[..i].iter().any(|p| (p.a == ls.a && p.b == ls.b) || (p.a == ls.b && p.b == ls.a)),
+                "LinkSpec[{}] is a parallel link between {} and {}; the sim wires at most one link \
+                 per unordered pair (NeighborId is aliased to the global node index, see #37)",
+                i,
+                ls.a,
+                ls.b
             );
         }
         let rng = Rng::new(seed);
@@ -210,24 +241,41 @@ impl Fabric {
         let local = self.local(node);
         let emit = self.nodes[node].engine.step(local).emit;
         // gather candidate deliveries first (no rng), then apply loss + schedule (rng + queue)
-        let mut cands: Vec<(usize, Duration, f64)> = Vec::new();
+        let mut cands: Vec<(usize, usize, Duration, f64)> = Vec::new();
         for a in &self.adj[node] {
             let link = &self.links[a.link];
             if link.up && self.nodes[a.other].up {
-                cands.push((a.other, self.time + link.delay, link.loss));
+                cands.push((a.other, a.link, self.time + link.delay, link.loss));
             }
         }
-        for (to, at, loss) in cands {
+        for (to, link, at, loss) in cands {
             if self.rng.chance(loss) {
                 continue; // dropped in flight
             }
-            self.queue.push(at, Event::Deliver { to, from: NeighborId(node as u32), msg: emit.clone() });
+            // `NeighborId(node as u32)` is the global index of the emitting node. This is a valid
+            // neighbour handle at `to` only because the topology wires at most one link per ordered
+            // pair (enforced in `build`) and each engine keys its neighbours by global node index
+            // (see `add_neighbor` in `build`). With multiple parallel links a→b this aliasing would
+            // mis-attribute the message; the `build` guard prevents that (#37).
+            self.queue.push(
+                at,
+                Event::Deliver { to, from: NeighborId(node as u32), link, msg: emit.clone() },
+            );
         }
     }
 
-    fn do_deliver(&mut self, to: usize, from: NeighborId, msg: ring_core::Message) {
+    fn do_deliver(&mut self, to: usize, from: NeighborId, link: usize, msg: ring_core::Message) {
         if !self.nodes[to].up {
             return; // a powered-off node receives nothing
+        }
+        // Drop a message whose link was cut while it was in flight (#29). A `cut_link` applied
+        // after this Deliver was enqueued must take effect immediately: the link is severed, so
+        // the in-transit frame is lost on the wire and never reaches the engine — otherwise a
+        // fresh cut would grant one extra tick of spurious liveness across it.
+        // `from.0` is the emitting node's global index; the same `NeighborId == global node index`
+        // invariant the enqueue relies on (#37) makes this a precise drop.
+        if !self.links[link].up {
+            return;
         }
         // Re-admit a wired neighbour the engine reclaimed while the peer was
         // silent (neighbour pruning, #24/#4): the sim driver's analogue of the
@@ -256,7 +304,7 @@ impl Fabric {
             self.time = s.time;
             match s.event {
                 Event::Emit { node } => self.do_emit(node),
-                Event::Deliver { to, from, msg } => self.do_deliver(to, from, msg),
+                Event::Deliver { to, from, link, msg } => self.do_deliver(to, from, link, msg),
             }
         }
         self.time = end;
@@ -406,5 +454,82 @@ mod tests {
         let links = [LinkSpec { a: 0, b: 1, g: 2.5, delay_ticks: 1.0, loss: 0.0 }];
         let fab = Fabric::build_aligned(2, &links, cfg, 1);
         assert_eq!(fab.n(), 2);
+    }
+
+    // ── guard #37: parallel links between the same pair are rejected at build ──────
+    #[test]
+    #[should_panic(expected = "parallel link")]
+    fn parallel_links_panic() {
+        let cfg = Config::default();
+        // two links between {0,1} — opposite orientation, still the same unordered pair
+        let links = [LinkSpec::clean(0, 1), LinkSpec::clean(1, 0)];
+        let _fab = Fabric::build_aligned(2, &links, cfg, 1);
+    }
+
+    #[test]
+    #[should_panic(expected = "self-loop")]
+    fn self_loop_link_panics() {
+        let cfg = Config::default();
+        let links = [LinkSpec::clean(0, 0)];
+        let _fab = Fabric::build_aligned(2, &links, cfg, 1);
+    }
+
+    // ── guard #36: a node index that overflows the prefix hextet panics ───────────
+    #[test]
+    #[should_panic(expected = "overflows the IPv6 prefix hextet")]
+    fn node_prefix_hextet_overflow_panics() {
+        let _ = node_prefix(0xffff); // i + 1 == 0x10000 would wrap to 0 — must assert instead
+    }
+
+    #[test]
+    fn node_prefix_max_in_range_works() {
+        let p = node_prefix(0xfffe); // i + 1 == 0xffff, the largest representable index
+        assert_eq!(p.addr.segments()[3], 0xffff);
+    }
+
+    // ── guard #29: a link cut drops messages already in flight on that link ────────
+    //
+    // Before the fix, `do_deliver` re-checked only `nodes[to].up`, never the LINK the message
+    // arrived on, so a frame already enqueued when the link was cut still delivered — granting one
+    // extra tick of spurious liveness across a fresh cut. This test converges a 2-node line, lets
+    // node 0's vitality toward dest 1 age DOWN while the link is cut, then injects a message that
+    // node 1 emitted (vintage, "in flight") onto the cut link. With the fix the message is dropped
+    // and node 0's vitality is NOT bumped back up; with the bug it would be. The test therefore
+    // FAILS if the link-state check in `do_deliver` is removed.
+    #[test]
+    fn cut_link_drops_in_flight_message() {
+        let cfg = crate::multihop_cfg();
+        let mut fab = Fabric::line(2, cfg, 7);
+        fab.run_ticks(120);
+        let dst1 = fab.nodes[1].id.clone();
+        assert!(fab.is_routable(0, 1), "0 should have learned 1 before the cut");
+
+        // Capture a message node 1 emits right now: this is the frame that will be "in flight".
+        let now1 = fab.local(1);
+        let in_flight = fab.nodes[1].engine.step(now1).emit;
+
+        let link = fab.link_between(0, 1).expect("the single 0-1 link");
+        fab.cut_link(link);
+
+        // Age node 0's stored vitality toward dest 1 well below its converged value by advancing
+        // time with the link down (no new evidence can arrive — the link is cut).
+        fab.run_ticks(40);
+        let vit_before = fab.nodes[0].engine.peek_vit(&dst1).expect("0 knows dest 1");
+
+        // Inject the vintage in-flight frame on the (now cut) link and process it.
+        let at = fab.time + Duration::from_nanos(1);
+        fab.queue.push(
+            at,
+            Event::Deliver { to: 0, from: NeighborId(1), link, msg: in_flight },
+        );
+        fab.run_until(at);
+
+        let vit_after = fab.nodes[0].engine.peek_vit(&dst1).expect("0 still knows dest 1");
+        // Allow a hair of aging slack; assert NO upward bump (the dropped message must not refresh).
+        assert!(
+            vit_after <= vit_before + 1e-12,
+            "in-flight message on a cut link must be dropped, not delivered: \
+             vit {vit_before} -> {vit_after}"
+        );
     }
 }
