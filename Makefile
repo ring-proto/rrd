@@ -3,7 +3,7 @@
 RTPROTO_SRC := etc/rt_protos.d/ring.conf
 RTPROTO_DST := /etc/iproute2/rt_protos.d/ring.conf
 
-.PHONY: build test demo install-rtproto uninstall-rtproto
+.PHONY: build test demo multihop install-rtproto uninstall-rtproto
 
 build:                ## release build of the daemon
 	cargo build --release -p rrd
@@ -11,8 +11,11 @@ build:                ## release build of the daemon
 test:                 ## full workspace test suite
 	cargo test
 
-demo:                 ## rootless live netns routing demo (no sudo)
+demo:                 ## rootless live netns routing demo — 2-hop milestone (no sudo)
 	bash harness/demo.sh
+
+multihop:             ## rootless live MULTI-hop demo — real packets across a 4-hop line at the default reach
+	bash harness/multihop.sh
 
 # ── proto-name mapping (DISPLAY ONLY) ────────────────────────────────────────
 # The kernel always stores RING's route protocol numerically (155); the daemon
