@@ -333,15 +333,16 @@ impl<T: Transport> Daemon<T> {
                     if let Err(e) = self.transport.send(&encoded).await {
                         tracing::warn!("transport send error (all interfaces failed): {}", e);
                     }
-                    // FIB reconcile after each tick. Capture the per-pass stats into
-                    // a local so the `&mut self.fib` borrow ends before we update the
+                    // FIB reconcile after each tick. Build the intents first (an
+                    // immutable borrow of `self`), then take the `&mut self.fib`
+                    // borrow only inside the block so it ends before we update the
                     // cumulative counters on `self`.
                     if self.fib.is_some() {
                         let intents = self.build_route_intents();
-                        let stats = {
-                            let fib = self.fib.as_mut().unwrap();
-                            fib.reconcile(&intents).await
-                        };
+                        let mut stats = crate::fib::ReconcileStats::default();
+                        if let Some(fib) = &mut self.fib {
+                            stats = fib.reconcile(&intents).await;
+                        }
                         self.fib_ops += stats.ops as u64;
                         self.fib_errors += stats.errors as u64;
                     }
