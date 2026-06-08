@@ -50,6 +50,14 @@ pub struct Engine {
     stress: f64,
 
     fbuf: Vec<f64>, // reused neighbour-sum scratch
+    // Reused per-step scratch (#27): the bidirectional-neighbour set and their effective
+    // conductances. Taken out via `mem::take` at the top of `step` (so they're plain locals with
+    // no self-borrow conflict) and stored back at the end, preserving capacity across steps. The
+    // emitted `delta`/`hears` are NOT pooled — they escape into `StepOutput.emit` carrying owned
+    // `RouterId`s, whose clone cost dominates the (single, pre-sized) Vec allocation; pooling them
+    // would need a borrowing `Message`, out of scope here.
+    bidir_buf: Vec<NeighborId>,
+    geff_buf: Vec<f64>,
 }
 
 impl Engine {
@@ -75,6 +83,8 @@ impl Engine {
             load: 0.0,
             stress: 0.0,
             fbuf: Vec::new(),
+            bidir_buf: Vec::new(),
+            geff_buf: Vec::new(),
         };
         // The primary origin always fits (ndest == 0) and is a known local origin, so it
         // bypasses the budget; the Option can never be None here.
@@ -306,11 +316,18 @@ impl Engine {
             self.cfg.glide,
         );
 
-        let bidir: Vec<NeighborId> = self.bidir(now);
-        let geff: Vec<f64> = bidir
-            .iter()
-            .map(|n| self.peer_conductance(&self.neighbors[n], now))
-            .collect();
+        // Reuse the persistent scratch (#27): take the buffers out so they are plain locals (no
+        // self-borrow conflict with `self.fbuf`/`self.neighbors` below), then store them back at
+        // the end of the relaxation, preserving their capacity across steps.
+        let mut bidir = std::mem::take(&mut self.bidir_buf);
+        self.fill_bidir(&mut bidir);
+        let mut geff = std::mem::take(&mut self.geff_buf);
+        geff.clear();
+        geff.extend(
+            bidir
+                .iter()
+                .map(|n| self.peer_conductance(&self.neighbors[n], now)),
+        );
         let gsum: f64 = geff.iter().sum();
 
         let ndest = self.ndest();
@@ -382,6 +399,9 @@ impl Engine {
             }
         }
         self.load = carried;
+        // Return the scratch buffers (with their grown capacity) for the next step (#27).
+        self.bidir_buf = bidir;
+        self.geff_buf = geff;
 
         // Reach-ball GC. A slot is GC-eligible iff it is NOT an origin, has drained below the
         // floor (f < floor, unreachable), AND has decayed below φ (vit < φ, dead). vit was aged
@@ -546,18 +566,17 @@ impl Engine {
         self.last_aged = now;
     }
 
-    /// Bidirectional neighbours. Staleness is not a hard gate here: a silent
-    /// peer's advertised potentials lose influence through reciprocal
-    /// conductance aging in `step()`.
-    fn bidir(&self, _now: Mono) -> Vec<NeighborId> {
-        let mut out = Vec::new();
+    /// Fill `buf` with the bidirectional neighbours (sorted). Staleness is not a hard gate here:
+    /// a silent peer's advertised potentials lose influence through reciprocal conductance aging
+    /// in `step()`. Takes a caller-owned buffer so `step` can reuse its capacity (#27).
+    fn fill_bidir(&self, buf: &mut Vec<NeighborId>) {
+        buf.clear();
         for (id, p) in &self.neighbors {
             if p.hears {
-                out.push(*id);
+                buf.push(*id);
             }
         }
-        out.sort();
-        out
+        buf.sort();
     }
 
     fn peer_conductance(&self, p: &Peer, now: Mono) -> f64 {
