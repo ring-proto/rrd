@@ -41,6 +41,7 @@ pub(crate) struct NodeState {
 pub(crate) struct Link {
     pub a: usize,
     pub b: usize,
+    pub g: f64,
     pub delay: Duration,
     pub loss: f64,
     pub up: bool,
@@ -114,6 +115,7 @@ impl Fabric {
             link_vec.push(Link {
                 a: ls.a,
                 b: ls.b,
+                g: ls.g,
                 delay: mul_dur(cfg.tick, ls.delay_ticks),
                 loss: ls.loss,
                 up: true,
@@ -226,6 +228,19 @@ impl Fabric {
     fn do_deliver(&mut self, to: usize, from: NeighborId, msg: ring_core::Message) {
         if !self.nodes[to].up {
             return; // a powered-off node receives nothing
+        }
+        // Re-admit a wired neighbour the engine reclaimed while the peer was
+        // silent (neighbour pruning, #24/#4): the sim driver's analogue of the
+        // daemon re-resolving an (iface,src) after pruning, restoring the link's
+        // configured conductance so a returning source is heard again. Engines
+        // ignore an ingest from an unknown NeighborId, so this is a no-op for a
+        // neighbour that is still present.
+        if !self.nodes[to].engine.has_neighbor(from) {
+            self.nodes[to].engine.add_neighbor(from);
+            if let Some(li) = self.adj[to].iter().find(|a| a.other as u32 == from.0) {
+                let g = self.links[li.link].g;
+                self.nodes[to].engine.set_neighbor_conductance(from, g);
+            }
         }
         let local = self.local(to);
         self.nodes[to].engine.ingest(local, from, &msg);

@@ -194,6 +194,13 @@ impl Engine {
         self.neighbors.len()
     }
 
+    /// Whether `n` is currently a wired neighbour. A driver re-admitting a source after the
+    /// engine reclaimed its silent peer (see `StepOutput.pruned`) can use this to avoid
+    /// clobbering a still-present neighbour's state.
+    pub fn has_neighbor(&self, n: NeighborId) -> bool {
+        self.neighbors.contains_key(&n)
+    }
+
     /// Test/inspection helper: the retained weighted uphill set toward `dest` (descending by
     /// current-split weight). This is the full multipath set; the daemon installs a prefix of it.
     pub fn peek_hops(&self, dest: &RouterId) -> Option<Vec<WeightedHop>> {
@@ -425,6 +432,18 @@ impl Engine {
         let dwell = self.cfg.gc_dwell;
         let mut pruned: Vec<NeighborId> = Vec::new();
         self.neighbors.retain(|id, p| {
+            // A freshly-wired peer that has never been heard from (`heard` still at
+            // the ZERO sentinel) carries NO link-aging evidence to age — it was never
+            // alive to go silent. It must not be reclaimed: under the daemon's and
+            // sim's clock base every real `heard`/`now` is well above ZERO, so this
+            // sentinel exclusively means "added but awaiting its first message" (the
+            // driver adds a neighbour and ingests in the same breath). Without this
+            // guard such a peer's `g_eff` collapses instantly against the large base
+            // clock and it is reaped before it can converge.
+            if p.heard == Mono::ZERO {
+                p.live_at = now;
+                return true;
+            }
             let g_eff = if no_link_age {
                 p.g
             } else {
@@ -1274,9 +1293,12 @@ mod tests {
         // A neighbour that goes silent forever must be reclaimed once its link
         // conductance has aged at or below `floor` (the Hears-echo horizon) and
         // it backs no route. With defaults g_eff = age(α, d, k) ≤ floor needs
-        // k ≈ 44_718 ticks; a single jump to tick*60_000 clears both that and
-        // the gc_dwell (live_at is only refreshed on steps/ingest).
+        // k ≈ 44_718 ticks; a single jump of tick*60_000 past the base clears
+        // both that and the gc_dwell (live_at is only refreshed on steps/ingest).
         let cfg = Config::default();
+        // A non-zero base mirrors the daemon/sim clock base: a real `heard` is
+        // never the ZERO sentinel (which means "never heard, do not prune").
+        let base = cfg.tick * 1000;
         let mut a = Engine::new(RouterId::from("a"), px(1), cfg, Default::default());
         a.add_neighbor(NeighborId(1));
         // Ingest one message at the base time so heard/live_at are set there.
@@ -1290,13 +1312,13 @@ mod tests {
                 vit: 1.0,
             }],
         };
-        a.ingest(Duration::ZERO, NeighborId(1), &msg);
+        a.ingest(base, NeighborId(1), &msg);
         // Step at the base time: the peer is fresh, so it is alive.
-        a.step(Duration::ZERO);
+        a.step(base);
         assert_eq!(a.neighbor_count(), 1, "fresh peer is retained");
 
         // Jump far past the floor horizon AND the dwell: the peer is pruned.
-        let out = a.step(cfg.tick * 60_000);
+        let out = a.step(base + cfg.tick * 60_000);
         assert_eq!(a.neighbor_count(), 0, "silent peer past the floor is reclaimed");
         assert!(
             out.pruned.contains(&NeighborId(1)),
@@ -1336,6 +1358,7 @@ mod tests {
         // No permanent mute: a pruned source returning is re-admitted as a fresh
         // neighbour and routes through it again.
         let cfg = Config::default();
+        let base = cfg.tick * 1000;
         let mut a = Engine::new(RouterId::from("a"), px(1), cfg, Default::default());
         a.add_neighbor(NeighborId(1));
         let msg = Message {
@@ -1348,14 +1371,14 @@ mod tests {
                 vit: 1.0,
             }],
         };
-        a.ingest(Duration::ZERO, NeighborId(1), &msg);
-        a.step(Duration::ZERO);
-        let out = a.step(cfg.tick * 60_000);
+        a.ingest(base, NeighborId(1), &msg);
+        a.step(base);
+        let out = a.step(base + cfg.tick * 60_000);
         assert_eq!(a.neighbor_count(), 0, "peer pruned after long silence");
         assert!(out.pruned.contains(&NeighborId(1)));
 
         // The source returns: re-admit and drive the link bidirectional again.
-        let resume = cfg.tick * 60_000;
+        let resume = base + cfg.tick * 60_000;
         a.add_neighbor(NeighborId(1));
         for k in 0..5u32 {
             let now = resume + cfg.tick * k;
@@ -1378,6 +1401,9 @@ mod tests {
             no_link_age: true,
             ..Config::default()
         };
+        // Non-zero base so the peer has been genuinely heard (heard != ZERO):
+        // this exercises the no_link_age path (g_eff = g), not the never-heard guard.
+        let base = cfg.tick * 1000;
         let mut a = Engine::new(RouterId::from("a"), px(1), cfg, Default::default());
         a.add_neighbor(NeighborId(1));
         let msg = Message {
@@ -1390,10 +1416,10 @@ mod tests {
                 vit: 1.0,
             }],
         };
-        a.ingest(Duration::ZERO, NeighborId(1), &msg);
-        a.step(Duration::ZERO);
+        a.ingest(base, NeighborId(1), &msg);
+        a.step(base);
         // Same long-silence jump as the prune test — but nothing is eligible.
-        let out = a.step(cfg.tick * 60_000);
+        let out = a.step(base + cfg.tick * 60_000);
         assert_eq!(a.neighbor_count(), 1, "no_link_age pins the relay forever");
         assert!(out.pruned.is_empty(), "nothing pruned under no_link_age");
     }
