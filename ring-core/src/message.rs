@@ -31,6 +31,12 @@ pub struct WeightedHop {
 #[derive(Clone, Debug)]
 pub struct StepOutput {
     pub emit: Message,
+    /// Neighbours reclaimed this step: silent long enough that their link
+    /// conductance has aged at or below `floor` (the horizon at which they also
+    /// leave the `Hears` echo) and backing no current route. The driver must drop
+    /// any `(iface, src) -> id` mapping it holds for these so a returning source
+    /// is re-admitted as a fresh neighbour. Empty on the vast majority of steps.
+    pub pruned: Vec<NeighborId>,
 }
 
 /// The data-plane read for one destination: dominant next-hop, aged vitality, and whether the

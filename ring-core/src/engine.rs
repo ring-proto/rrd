@@ -14,6 +14,10 @@ struct Peer {
     pot: Vec<f64>, // dense over local dest slots; 0.0 = not yet learned
     hears: bool,
     heard: Mono,
+    /// Last `now` at which the peer was NOT prune-eligible (analogous to the dest
+    /// GC's `gc_ok_at`). Neighbour reclamation drops a peer once it has been
+    /// continuously eligible for `cfg.gc_dwell` ticks.
+    live_at: Mono,
 }
 
 pub struct Engine {
@@ -117,6 +121,7 @@ impl Engine {
             pot,
             hears: false,
             heard: Mono::ZERO,
+            live_at: Mono::ZERO,
         });
     }
 
@@ -159,6 +164,7 @@ impl Engine {
         }
         p.hears = hears;
         p.heard = now;
+        p.live_at = now; // a peer we just heard from is alive
     }
 
     /// Override a neighbour's link conductance `g` (bandwidth). Used to express per-link capacity;
@@ -179,6 +185,13 @@ impl Engine {
     /// `cfg.max_dests` for untrusted entries; shrinks as reach-ball GC evicts drained dead slots.
     pub fn dest_count(&self) -> usize {
         self.dest_key.len()
+    }
+
+    /// The number of neighbours currently in the table (origins-independent). Bounded under
+    /// churn by neighbour reclamation: a silent peer is dropped once its conductance ages
+    /// below the floor and it backs no route.
+    pub fn neighbor_count(&self) -> usize {
+        self.neighbors.len()
     }
 
     /// Test/inspection helper: the retained weighted uphill set toward `dest` (descending by
@@ -377,12 +390,66 @@ impl Engine {
             self.compact(&evict);
         }
 
+        // Neighbour reclamation — the neighbour-table analogue of the reach-ball
+        // dest GC. A Peer is prune-eligible once its link conductance has aged at
+        // or below `floor` (the same horizon at which it leaves the Hears echo —
+        // its evidence is numerically negligible) AND it backs no current route.
+        // A still-heard or still-load-bearing peer refreshes its dwell clock; one
+        // continuously eligible for `gc_dwell` ticks is dropped, freeing its
+        // O(ndest) potential vector. Non-load-bearing: an eligible peer already
+        // contributes ~0 to every field, so its removal changes no route. The
+        // horizon tightens automatically under space-time alignment (§8), exactly
+        // as the dest GC does. Under no_link_age nothing is eligible (g_eff = g).
+        //
+        // `in_use` collects the neighbours backing a current route, where a hop
+        // counts only if it is genuinely load-bearing — its current-split weight
+        // `g_eff·(pot−f)` exceeds the floor. A peer aged to `g_eff ≤ floor` can
+        // only ever contribute hop weights `≤ floor` (it is the SAME numerically-
+        // negligible horizon as condition 1), so it does not pin a route here —
+        // matching the design's "contributes ~0 to every field" exactly, while a
+        // real relay (g_eff ≈ d) yields weights orders of magnitude above floor.
+        // dominant[d], when set, is always hops[d][0] (the max-weight hop), so
+        // scanning hops subsumes it.
+        let floor = self.cfg.floor;
+        let mut in_use: std::collections::HashSet<NeighborId> = std::collections::HashSet::new();
+        for d in 0..self.ndest() {
+            for h in &self.hops[d] {
+                if h.weight > floor {
+                    in_use.insert(h.via);
+                }
+            }
+        }
+        let alpha = self.cfg.alpha;
+        let tick = self.cfg.tick;
+        let no_link_age = self.cfg.no_link_age;
+        let dwell = self.cfg.gc_dwell;
+        let mut pruned: Vec<NeighborId> = Vec::new();
+        self.neighbors.retain(|id, p| {
+            let g_eff = if no_link_age {
+                p.g
+            } else {
+                age(alpha, p.g, ticks_between(p.heard, now, tick))
+            };
+            let eligible = g_eff <= floor && !in_use.contains(id);
+            if !eligible {
+                p.live_at = now;
+                true
+            } else if ticks_between(p.live_at, now, tick) >= dwell {
+                pruned.push(*id);
+                false
+            } else {
+                true
+            }
+        });
+        pruned.sort(); // deterministic order for the driver/tests
+
         StepOutput {
             emit: Message {
                 from: self.id.clone(),
                 hears: self.heard_list(now),
                 delta,
             },
+            pruned,
         }
     }
 
@@ -1307,8 +1374,10 @@ mod tests {
     fn no_link_age_never_prunes_neighbour() {
         // Under the no_link_age ablation g_eff = g = d > floor always, so a peer
         // is never prune-eligible (the ablation pins the relay).
-        let mut cfg = Config::default();
-        cfg.no_link_age = true;
+        let cfg = Config {
+            no_link_age: true,
+            ..Config::default()
+        };
         let mut a = Engine::new(RouterId::from("a"), px(1), cfg, Default::default());
         a.add_neighbor(NeighborId(1));
         let msg = Message {
