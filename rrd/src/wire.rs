@@ -38,6 +38,13 @@ const MAGIC: &[u8; 4] = b"RING";
 /// Current wire protocol version.
 const VERSION: u8 = 1;
 
+/// Maximum number of delta entries accepted from an untrusted frame (parse-time allocation bound).
+const MAX_DELTA: usize = 8192;
+/// Maximum number of hears entries accepted from an untrusted frame.
+/// Note: the wire encodes hears count as u8, so the actual limit is already ≤ 255,
+/// but we make the bound explicit and symmetric.
+const MAX_HEARS: usize = 256;
+
 /// Errors returned by [`decode`].
 #[derive(Debug, PartialEq, Error)]
 pub enum WireError {
@@ -51,6 +58,8 @@ pub enum WireError {
     BadUtf8,
     #[error("out-of-range or non-finite value: {0}")]
     BadValue(String),
+    #[error("count field too large: {0}")]
+    TooLarge(String),
 }
 
 // ───────────────────────── encoder ──────────────────────────────────────────
@@ -89,6 +98,7 @@ pub fn encode(msg: &Message) -> Vec<u8> {
 }
 
 fn encode_str(buf: &mut Vec<u8>, s: &str) {
+    debug_assert!(s.len() <= 255, "encode_str: string exceeds 255 bytes, will be silently truncated");
     let bytes = s.as_bytes();
     let len = bytes.len().min(255) as u8;
     buf.push(len);
@@ -122,6 +132,12 @@ pub fn decode(buf: &[u8]) -> Result<Message, WireError> {
 
     // hears
     let hears_count = read_u8(buf, &mut pos)? as usize;
+    if hears_count > MAX_HEARS {
+        return Err(WireError::TooLarge(format!(
+            "hears count {} > MAX_HEARS {}",
+            hears_count, MAX_HEARS
+        )));
+    }
     let mut hears = Vec::with_capacity(hears_count);
     for _ in 0..hears_count {
         hears.push(RouterId(read_str(buf, &mut pos)?));
@@ -129,6 +145,12 @@ pub fn decode(buf: &[u8]) -> Result<Message, WireError> {
 
     // delta
     let delta_count = read_u16_be(buf, &mut pos)? as usize;
+    if delta_count > MAX_DELTA {
+        return Err(WireError::TooLarge(format!(
+            "delta count {} > MAX_DELTA {}",
+            delta_count, MAX_DELTA
+        )));
+    }
     let mut delta = Vec::with_capacity(delta_count);
     for _ in 0..delta_count {
         let dest = RouterId(read_str(buf, &mut pos)?);
@@ -589,5 +611,81 @@ mod tests {
                 assert!((d.vit - e.vit).abs() < f64::EPSILON);
             }
         }
+    }
+
+    // ── guard #19: delta_count too large → TooLarge before any allocation ─
+
+    /// Craft a frame with valid magic/version/from/hears but a delta_count of 60000
+    /// (which is > MAX_DELTA=8192) and a truncated body (no actual entries).
+    /// The decoder must reject on the count, not on truncation of entries.
+    fn craft_large_delta_count_frame(delta_count: u16) -> Vec<u8> {
+        let mut buf = Vec::new();
+        buf.extend_from_slice(b"RING"); // magic
+        buf.push(1u8); // version
+        buf.push(0u8); // flags
+        // from: "n" (1 byte len + 1 byte content)
+        buf.push(1u8);
+        buf.push(b'n');
+        // hears: 0
+        buf.push(0u8);
+        // delta_count: big endian u16
+        buf.extend_from_slice(&delta_count.to_be_bytes());
+        // body: empty (truncated after the count)
+        buf
+    }
+
+    #[test]
+    fn reject_delta_count_over_max_delta() {
+        // 60000 > MAX_DELTA=8192; the frame body has no entries — must error on count
+        let buf = craft_large_delta_count_frame(60000);
+        let result = decode(&buf);
+        assert!(
+            matches!(result, Err(WireError::TooLarge(_))),
+            "expected TooLarge for delta_count=60000, got {:?}",
+            result
+        );
+    }
+
+    #[test]
+    fn reject_delta_count_exactly_max_delta_plus_one() {
+        // MAX_DELTA + 1 = 8193 > 8192; truncated body
+        let buf = craft_large_delta_count_frame((MAX_DELTA + 1) as u16);
+        let result = decode(&buf);
+        assert!(
+            matches!(result, Err(WireError::TooLarge(_))),
+            "expected TooLarge for delta_count={}, got {:?}",
+            MAX_DELTA + 1,
+            result
+        );
+    }
+
+    #[test]
+    fn accept_delta_count_at_max_delta_if_body_present() {
+        // MAX_DELTA entries would need a full body; just check that delta_count=1 (well within
+        // the limit) still parses correctly (existing round-trip tests cover this, but make it
+        // explicit for the MAX_DELTA boundary context).
+        let msg = Message {
+            from: router_id("n"),
+            hears: vec![],
+            delta: vec![Entry {
+                dest: router_id("d"),
+                prefix: Prefix { addr: Ipv6Addr::UNSPECIFIED, len: 64 },
+                pot: 0.5,
+                vit: 0.5,
+            }],
+        };
+        assert!(decode(&encode(&msg)).is_ok(), "single entry must parse fine");
+    }
+
+    #[test]
+    fn reject_delta_count_at_wire_maximum_u16_max() {
+        // 65535 (u16::MAX) >> MAX_DELTA: must reject without trying to allocate/iterate
+        let buf = craft_large_delta_count_frame(u16::MAX);
+        let result = decode(&buf);
+        assert!(
+            matches!(result, Err(WireError::TooLarge(_))),
+            "expected TooLarge for delta_count=65535, got {:?}",
+            result
+        );
     }
 }

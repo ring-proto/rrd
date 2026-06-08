@@ -115,6 +115,12 @@ pub struct DaemonConfig {
 impl DaemonConfig {
     /// Build a [`DaemonConfig`] from a parsed [`Cli`], resolving interface names.
     pub fn from_cli(cli: &Cli) -> Result<Self, String> {
+        if cli.router_id.len() > 255 {
+            return Err(format!(
+                "router-id is {} bytes (UTF-8), max 255 (encode_str limit)",
+                cli.router_id.len()
+            ));
+        }
         let router_id = RouterId(cli.router_id.clone());
         let prefix = parse_prefix(&cli.prefix)?;
 
@@ -131,12 +137,30 @@ impl DaemonConfig {
             ..Config::default()
         };
         if let Some(k) = cli.kappa {
+            if !k.is_finite() || k <= 0.0 {
+                return Err(format!(
+                    "kappa must be finite and > 0 (got {}); required for the screened M-matrix q_i > 0",
+                    k
+                ));
+            }
             cfg.kappa = k;
         }
         if let Some(a) = cli.alpha {
+            if !a.is_finite() || a <= 0.0 {
+                return Err(format!(
+                    "alpha must be finite and > 0 (got {})",
+                    a
+                ));
+            }
             cfg.alpha = a;
         }
         if let Some(p) = cli.phi {
+            if !p.is_finite() || p <= 0.0 || p >= 1.0 {
+                return Err(format!(
+                    "phi must be finite and in (0, 1) exclusive (got {})",
+                    p
+                ));
+            }
             cfg.phi = p;
         }
 
@@ -286,5 +310,97 @@ mod tests {
         };
         let dc = DaemonConfig::from_cli(&cli).expect("should build");
         assert_eq!(dc.policy.max_paths, 1, "max_paths must never be zero");
+    }
+
+    // ── guard #5: kappa validation ────────────────────────────────────────
+
+    fn base_cli() -> Cli {
+        Cli {
+            router_id: "testnode".to_string(),
+            prefix: "fd00::1/64".to_string(),
+            ifaces: vec![],
+            tick_ms: 100,
+            kappa: None,
+            alpha: None,
+            phi: None,
+            max_dests: 65536,
+            gc_dwell: 32.0,
+            no_fib: false,
+            max_paths: 1,
+            control_socket: None,
+        }
+    }
+
+    #[test]
+    fn kappa_zero_is_rejected() {
+        let cli = Cli { kappa: Some(0.0), ..base_cli() };
+        assert!(
+            DaemonConfig::from_cli(&cli).is_err(),
+            "kappa=0 must be rejected"
+        );
+    }
+
+    #[test]
+    fn kappa_negative_is_rejected() {
+        let cli = Cli { kappa: Some(-1.0), ..base_cli() };
+        assert!(
+            DaemonConfig::from_cli(&cli).is_err(),
+            "kappa=-1 must be rejected"
+        );
+    }
+
+    #[test]
+    fn kappa_nan_is_rejected() {
+        let cli = Cli { kappa: Some(f64::NAN), ..base_cli() };
+        assert!(
+            DaemonConfig::from_cli(&cli).is_err(),
+            "kappa=NaN must be rejected"
+        );
+    }
+
+    #[test]
+    fn kappa_inf_is_rejected() {
+        let cli = Cli { kappa: Some(f64::INFINITY), ..base_cli() };
+        assert!(
+            DaemonConfig::from_cli(&cli).is_err(),
+            "kappa=Inf must be rejected"
+        );
+    }
+
+    #[test]
+    fn kappa_positive_is_accepted() {
+        let cli = Cli { kappa: Some(0.05), ..base_cli() };
+        let dc = DaemonConfig::from_cli(&cli).expect("kappa=0.05 must be accepted");
+        assert!((dc.cfg.kappa - 0.05).abs() < 1e-12);
+    }
+
+    // ── guard #17: router-id length ───────────────────────────────────────
+
+    #[test]
+    fn router_id_255_bytes_is_accepted() {
+        let id = "x".repeat(255);
+        let cli = Cli { router_id: id.clone(), ..base_cli() };
+        let dc = DaemonConfig::from_cli(&cli).expect("255-byte router-id must be accepted");
+        assert_eq!(dc.router_id.0, id);
+    }
+
+    #[test]
+    fn router_id_256_bytes_is_rejected() {
+        let id = "x".repeat(256);
+        let cli = Cli { router_id: id, ..base_cli() };
+        assert!(
+            DaemonConfig::from_cli(&cli).is_err(),
+            "256-byte router-id must be rejected"
+        );
+    }
+
+    #[test]
+    fn router_id_300_bytes_is_rejected() {
+        let id = "a".repeat(300);
+        let cli = Cli { router_id: id, ..base_cli() };
+        assert!(
+            DaemonConfig::from_cli(&cli).is_err(),
+            "300-byte router-id must be rejected"
+        );
     }
 }
