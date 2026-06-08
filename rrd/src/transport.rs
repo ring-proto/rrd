@@ -30,6 +30,11 @@ pub trait Transport: Send + Sync + 'static {
 
     /// The interface indices this transport operates on.
     fn interfaces(&self) -> Vec<u32>;
+
+    /// Request an immediate multicast re-join on all interfaces — e.g. after a link-up event,
+    /// so neighbour discovery across a healed link resumes at once rather than waiting for the
+    /// periodic re-join timer. Default: no-op (for transports without multicast membership).
+    fn request_rejoin(&self) {}
 }
 
 // ─────────────────────────── MemBus / MemTransport ───────────────────────────

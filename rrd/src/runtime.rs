@@ -260,6 +260,17 @@ impl<T: Transport> Daemon<T> {
             if locators.is_empty() {
                 continue;
             }
+            // ECMP weight hysteresis (#13): snap each float current-split weight to a
+            // `weight_quantum` grid before the kernel-weight mapping, so sub-quantum field jitter
+            // at a near-tie does not flicker the installed ECMP weights (which would thrash the
+            // FIB on every tick via the dirty-check). `weight_quantum == 0` (the default) is a
+            // no-op — exact weights, no damping.
+            let q = self.cfg.policy.weight_quantum;
+            if q > 0.0 {
+                for w in &mut weights {
+                    *w = (*w / q).round() * q;
+                }
+            }
             let ecmp = ecmp_weights(&weights);
             let nexthops: Vec<NextHop> = locators
                 .into_iter()
@@ -310,7 +321,10 @@ impl<T: Transport> Daemon<T> {
     /// the neighbours and the reconcile re-installs the routes.
     fn handle_link_event(&mut self, ev: crate::linkmon::LinkEvent) {
         if ev.up {
-            tracing::info!(iface = ev.ifindex, "link up — awaiting neighbour re-discovery");
+            // Re-join multicast immediately so neighbour discovery across the healed link resumes
+            // at once rather than waiting up to one periodic re-join (#13 follow-up).
+            self.transport.request_rejoin();
+            tracing::info!(iface = ev.ifindex, "link up — requested multicast re-join");
             return;
         }
         let dropped: Vec<NeighborId> = self

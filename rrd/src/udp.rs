@@ -14,8 +14,9 @@ use socket2::{Domain, Protocol, SockAddr, Socket, Type};
 use std::io;
 use std::net::{Ipv6Addr, SocketAddrV6};
 use std::os::unix::io::{FromRawFd, IntoRawFd};
+use std::sync::Arc;
 use tokio::net::UdpSocket;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, Notify};
 
 /// RING link-local multicast group: `ff02::7269:6e67`.
 ///
@@ -44,6 +45,9 @@ pub struct Udp6Transport {
     /// Handles to the per-socket reader tasks, aborted when the transport is dropped so a
     /// retired/reconfigured transport does not leave parked readers holding fds + buffers (#34).
     readers: Vec<tokio::task::JoinHandle<()>>,
+    /// Notified to ask every reader to re-join multicast immediately (on a link-up event) rather
+    /// than waiting for the periodic re-join timer.
+    rejoin_notify: Arc<Notify>,
 }
 
 impl Drop for Udp6Transport {
@@ -62,6 +66,7 @@ impl Udp6Transport {
 
         let mut sockets = Vec::with_capacity(ifaces.len());
         let mut readers = Vec::with_capacity(ifaces.len());
+        let rejoin_notify = Arc::new(Notify::new());
 
         for &ifindex in ifaces {
             let sock = make_socket(ifindex)?;
@@ -75,13 +80,20 @@ impl Udp6Transport {
             // Spawn a task that reads from this interface socket and forwards to
             // the shared receiver channel. Retain the handle so Drop can abort it.
             let tx_clone = tx.clone();
-            readers.push(tokio::spawn(reader_task(reader_sock, ifindex, tx_clone)));
+            let notify = rejoin_notify.clone();
+            readers.push(tokio::spawn(reader_task(
+                reader_sock,
+                ifindex,
+                tx_clone,
+                notify,
+            )));
         }
 
         Ok(Udp6Transport {
             sockets,
             rx,
             readers,
+            rejoin_notify,
         })
     }
 }
@@ -169,7 +181,12 @@ const RECV_ERROR_BACKOFF: std::time::Duration = std::time::Duration::from_millis
 /// `EINTR`, or similar error is logged and the loop continues after a short
 /// backoff so the interface can recover on its own (the periodic multicast
 /// re-join re-establishes group membership when the link comes back).
-async fn reader_task(sock: UdpSocket, ifindex: u32, tx: mpsc::Sender<Inbound>) {
+async fn reader_task(
+    sock: UdpSocket,
+    ifindex: u32,
+    tx: mpsc::Sender<Inbound>,
+    rejoin_notify: Arc<Notify>,
+) {
     let mut buf = vec![0u8; MAX_DGRAM];
     let mut rejoin = tokio::time::interval(REJOIN_PERIOD);
     rejoin.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -178,6 +195,12 @@ async fn reader_task(sock: UdpSocket, ifindex: u32, tx: mpsc::Sender<Inbound>) {
     loop {
         let (len, src_addr) = tokio::select! {
             _ = rejoin.tick() => {
+                rejoin_group(&sock, ifindex);
+                continue;
+            }
+            // On-demand re-join requested by the runtime on a link-up event — resume neighbour
+            // discovery across a healed link at once instead of waiting up to one REJOIN_PERIOD.
+            _ = rejoin_notify.notified() => {
                 rejoin_group(&sock, ifindex);
                 continue;
             }
@@ -310,6 +333,12 @@ impl Transport for Udp6Transport {
 
     fn interfaces(&self) -> Vec<u32> {
         self.sockets.iter().map(|(iface, _)| *iface).collect()
+    }
+
+    fn request_rejoin(&self) {
+        // Wake every parked reader to re-join multicast now. A reader busy processing a datagram
+        // misses this wake-up, but the periodic re-join (≤ REJOIN_PERIOD) is the backstop.
+        self.rejoin_notify.notify_waiters();
     }
 }
 
