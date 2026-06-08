@@ -357,9 +357,13 @@ impl<T: Transport> Daemon<T> {
                 _ = interval.tick() => {
                     let now = self.now();
                     let out = self.engine.step(now);
-                    let encoded = wire::encode(&out.emit);
-                    if let Err(e) = self.transport.send(&encoded).await {
-                        tracing::warn!("transport send error (all interfaces failed): {}", e);
+                    // Split the emission across MTU-sized frames so a large destination table
+                    // never silently wedges the datapath (TX EMSGSIZE / RX truncation). Each
+                    // frame is independently decodable; the receiver folds them incrementally.
+                    for frame in wire::encode_segments(&out.emit, wire::MAX_SEGMENT_PAYLOAD) {
+                        if let Err(e) = self.transport.send(&frame).await {
+                            tracing::warn!("transport send error (all interfaces failed): {}", e);
+                        }
                     }
                     // Reclaim address mappings for neighbours the engine pruned
                     // (silent past the link-aging horizon), bounding the

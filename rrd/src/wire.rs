@@ -40,6 +40,13 @@ const VERSION: u8 = 1;
 
 /// Maximum number of delta entries accepted from an untrusted frame (parse-time allocation bound).
 const MAX_DELTA: usize = 8192;
+
+/// Conservative maximum UDP payload that traverses any IPv6 path without fragmentation.
+/// The IPv6 minimum link MTU is 1280 bytes; subtracting the 40-byte IPv6 header and the
+/// 8-byte UDP header leaves 1232. We keep a margin. Deltas larger than one frame are split
+/// across multiple frames by [`encode_segments`] so the protocol does not silently wedge
+/// (TX `EMSGSIZE` / RX truncation) as the destination table grows.
+pub const MAX_SEGMENT_PAYLOAD: usize = 1200;
 /// Maximum number of hears entries accepted from an untrusted frame.
 /// Note: the wire encodes hears count as u8, so the actual limit is already ≤ 255,
 /// but we make the bound explicit and symmetric.
@@ -87,14 +94,89 @@ pub fn encode(msg: &Message) -> Vec<u8> {
     let delta_len = msg.delta.len().min(65535) as u16;
     buf.extend_from_slice(&delta_len.to_be_bytes());
     for e in msg.delta.iter().take(delta_len as usize) {
-        encode_str(&mut buf, &e.dest.0);
-        buf.extend_from_slice(&e.prefix.addr.octets());
-        buf.push(e.prefix.len);
-        buf.extend_from_slice(&e.pot.to_be_bytes());
-        buf.extend_from_slice(&e.vit.to_be_bytes());
+        encode_entry(&mut buf, e);
     }
 
     buf
+}
+
+/// Append one delta [`Entry`] to `buf` in wire format.
+fn encode_entry(buf: &mut Vec<u8>, e: &Entry) {
+    encode_str(buf, &e.dest.0);
+    buf.extend_from_slice(&e.prefix.addr.octets());
+    buf.push(e.prefix.len);
+    buf.extend_from_slice(&e.pot.to_be_bytes());
+    buf.extend_from_slice(&e.vit.to_be_bytes());
+}
+
+/// The encoded byte length of one delta [`Entry`] (matching [`encode_entry`]).
+fn entry_size(e: &Entry) -> usize {
+    1 + e.dest.0.len().min(255) // dest str (u8 len + bytes)
+        + 16 + 1                // ipv6 octets + prefix_len
+        + 8 + 8 // pot + vit
+}
+
+/// Encode `msg` into one or more wire frames, each at most `max_bytes` long, by splitting
+/// the delta across frames. **This is the daemon's send path**: a single multicast datagram
+/// must fit the link MTU, but the engine emits one delta entry per known destination, so a
+/// large table overflows one datagram.
+///
+/// Each returned frame is a COMPLETE, independently-decodable frame carrying the same `from`
+/// and `hears` header and a contiguous slice of the delta. No reassembly is needed: the
+/// receiver folds each frame's entries into the engine incrementally (ingest is per-entry and
+/// async-tolerant), and every destination is re-advertised each tick, so splitting the delta
+/// across datagrams within a tick is semantically identical to one big datagram.
+///
+/// Always returns at least one frame (an empty delta yields a single header-only frame, so a
+/// node with no routable destinations still advertises its `from`/`hears`). An entry whose own
+/// size plus the header exceeds `max_bytes` (a pathologically long router-id) is still emitted
+/// alone in its frame — best-effort; it may fragment, which is preferable to dropping it.
+pub fn encode_segments(msg: &Message, max_bytes: usize) -> Vec<Vec<u8>> {
+    // The fixed per-frame prefix (everything up to but not including delta_count): identical
+    // in every segment. Built once, then cloned per frame.
+    let mut prefix = Vec::with_capacity(64);
+    prefix.extend_from_slice(MAGIC);
+    prefix.push(VERSION);
+    prefix.push(0u8); // flags
+    encode_str(&mut prefix, &msg.from.0);
+    let hears_len = msg.hears.len().min(255) as u8;
+    prefix.push(hears_len);
+    for r in msg.hears.iter().take(hears_len as usize) {
+        encode_str(&mut prefix, &r.0);
+    }
+    // Per-frame overhead = prefix + the 2-byte delta_count.
+    let header_overhead = prefix.len() + 2;
+
+    let flush = |entries: &[&Entry], frames: &mut Vec<Vec<u8>>| {
+        let mut buf = Vec::with_capacity(header_overhead + 64);
+        buf.extend_from_slice(&prefix);
+        let n = entries.len().min(65535) as u16;
+        buf.extend_from_slice(&n.to_be_bytes());
+        for e in entries.iter().take(n as usize) {
+            encode_entry(&mut buf, e);
+        }
+        frames.push(buf);
+    };
+
+    let mut frames: Vec<Vec<u8>> = Vec::new();
+    let mut cur: Vec<&Entry> = Vec::new();
+    let mut cur_size = header_overhead;
+
+    for e in msg.delta.iter().take(65535) {
+        let esz = entry_size(e);
+        // Start a new frame if adding this entry would overflow — but never flush an empty
+        // frame (a single over-large entry goes alone, best-effort).
+        if !cur.is_empty() && cur_size + esz > max_bytes {
+            flush(&cur, &mut frames);
+            cur.clear();
+            cur_size = header_overhead;
+        }
+        cur.push(e);
+        cur_size += esz;
+    }
+    // Final frame (also the only frame when the delta is empty).
+    flush(&cur, &mut frames);
+    frames
 }
 
 fn encode_str(buf: &mut Vec<u8>, s: &str) {
@@ -687,5 +769,109 @@ mod tests {
             "expected TooLarge for delta_count=65535, got {:?}",
             result
         );
+    }
+
+    // ── #16: delta segmentation (encode_segments) ─────────────────────────
+
+    fn entry(i: usize) -> Entry {
+        Entry {
+            dest: router_id(&format!("router-{i}")),
+            prefix: Prefix { addr: Ipv6Addr::UNSPECIFIED, len: 64 },
+            pot: (i as f64) * 0.001,
+            vit: 0.5,
+        }
+    }
+
+    #[test]
+    fn encode_segments_small_delta_is_single_frame() {
+        let frames = encode_segments(&full_msg(), MAX_SEGMENT_PAYLOAD);
+        assert_eq!(frames.len(), 1, "a 2-entry delta fits one frame");
+        let d = decode(&frames[0]).unwrap();
+        assert_eq!(d.from, full_msg().from);
+        assert_eq!(d.delta.len(), 2);
+    }
+
+    #[test]
+    fn encode_segments_single_frame_byte_identical_to_encode() {
+        // With an effectively-unbounded budget, one segment must equal the monolithic encode —
+        // proves the shared encode_entry refactor did not change the byte format.
+        let msg = full_msg();
+        let frames = encode_segments(&msg, 100_000);
+        assert_eq!(frames.len(), 1);
+        assert_eq!(frames[0], encode(&msg));
+    }
+
+    #[test]
+    fn encode_segments_empty_delta_is_one_header_frame() {
+        // A node with no routable dests still advertises its from/hears in exactly one frame.
+        let msg = Message {
+            from: router_id("solo"),
+            hears: vec![router_id("nbr")],
+            delta: vec![],
+        };
+        let frames = encode_segments(&msg, MAX_SEGMENT_PAYLOAD);
+        assert_eq!(frames.len(), 1);
+        let d = decode(&frames[0]).unwrap();
+        assert!(d.delta.is_empty());
+        assert_eq!(d.from, msg.from);
+        assert_eq!(d.hears, msg.hears);
+    }
+
+    #[test]
+    fn encode_segments_splits_large_delta_and_reassembles_in_order() {
+        // 1000 entries must span many frames; every frame is independently decodable, ≤ the
+        // budget, carries the same from/hears, and the concatenation reproduces the delta exactly.
+        let delta: Vec<Entry> = (0..1000).map(entry).collect();
+        let msg = Message {
+            from: router_id("origin"),
+            hears: vec![router_id("nbr-a"), router_id("nbr-b")],
+            delta: delta.clone(),
+        };
+        let max = MAX_SEGMENT_PAYLOAD;
+        let frames = encode_segments(&msg, max);
+        assert!(frames.len() > 1, "1000 entries must span multiple frames");
+
+        let mut reassembled: Vec<Entry> = Vec::new();
+        for f in &frames {
+            assert!(f.len() <= max, "frame of {} bytes exceeds budget {}", f.len(), max);
+            let d = decode(f).expect("each segment decodes independently");
+            assert_eq!(d.from, msg.from, "from preserved in every segment");
+            assert_eq!(d.hears, msg.hears, "hears preserved in every segment");
+            reassembled.extend(d.delta);
+        }
+        assert_eq!(reassembled.len(), delta.len(), "no entry lost or duplicated");
+        for (got, want) in reassembled.iter().zip(delta.iter()) {
+            assert_eq!(got.dest, want.dest, "order + identity preserved");
+            assert_eq!(got.prefix.len, want.prefix.len);
+            assert!((got.pot - want.pot).abs() < f64::EPSILON);
+            assert!((got.vit - want.vit).abs() < f64::EPSILON);
+        }
+    }
+
+    #[test]
+    fn encode_segments_oversized_entry_goes_alone_best_effort() {
+        // A budget below even one entry+header must NOT drop entries: each is emitted alone.
+        let msg = Message {
+            from: router_id("o"),
+            hears: vec![],
+            delta: vec![entry(1), entry(2), entry(3)],
+        };
+        let frames = encode_segments(&msg, 8); // smaller than the header alone
+        assert_eq!(frames.len(), 3, "each entry forced into its own (over-budget) frame");
+        let mut all = Vec::new();
+        for f in &frames {
+            all.extend(decode(f).expect("over-budget frame is still a valid frame").delta);
+        }
+        assert_eq!(all.len(), 3, "all entries survive best-effort segmentation");
+    }
+
+    #[test]
+    fn encode_segments_default_payload_frames_fit_min_ipv6_mtu() {
+        // At the default budget, every frame fits the IPv6 minimum MTU (1280 − 48 headers).
+        let delta: Vec<Entry> = (0..500).map(entry).collect();
+        let msg = Message { from: router_id("n"), hears: vec![], delta };
+        for f in encode_segments(&msg, MAX_SEGMENT_PAYLOAD) {
+            assert!(f.len() <= 1232, "frame {} > 1232-byte non-fragmenting payload", f.len());
+        }
     }
 }

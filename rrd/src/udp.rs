@@ -191,6 +191,19 @@ async fn reader_task(sock: UdpSocket, ifindex: u32, tx: mpsc::Sender<Inbound>) {
             std::net::SocketAddr::V4(_) => continue,
         };
 
+        // Truncation guard: a datagram that exactly fills the buffer may have been
+        // cut short by the kernel (the tail is lost, so decode will reject the frame).
+        // Senders segment to MAX_SEGMENT_PAYLOAD (≪ MAX_DGRAM), so this only fires for a
+        // misbehaving/old peer emitting an oversized frame — surface it rather than hide it.
+        if len == buf.len() {
+            tracing::warn!(
+                iface = ifindex,
+                len,
+                "Udp6Transport reader[iface={}]: datagram filled the {}-byte buffer — possible truncation (frame may be rejected)",
+                ifindex, MAX_DGRAM,
+            );
+        }
+
         let inbound = Inbound {
             iface: ifindex,
             src,
