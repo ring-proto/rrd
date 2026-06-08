@@ -108,63 +108,41 @@ impl FibReconciler {
         })
     }
 
-    /// Reconcile the kernel FIB against `desired`, installing only the prefixes whose intent
-    /// differs from our bookkeeping (the cheap incremental path for the common change case).
+    /// Reconcile the kernel FIB against `desired`, installing the prefixes whose intent differs
+    /// from our bookkeeping and removing those no longer desired.
     ///
     /// - New or changed prefixes → add/replace.
     /// - Prefixes no longer desired → delete.
     /// - Errors → log warn, retry next tick.
+    ///
+    /// Our `installed` bookkeeping is kept consistent with the kernel by the runtime's link-state
+    /// monitor: when a link goes down the kernel flushes its routes AND the daemon drops that
+    /// link's neighbours, so the engine withdraws those destinations and this reconcile reaps the
+    /// matching `installed` entries (the delete then hits `is_already_gone` — already flushed).
+    /// There is therefore no kernel-flushed-but-still-claimed route to silently strand.
     pub async fn reconcile(&mut self, desired: &[RouteIntent]) -> ReconcileStats {
-        self.reconcile_inner(desired, false).await
-    }
-
-    /// Re-assert EVERY desired route unconditionally (idempotent `RTM_NEWROUTE` REPLACE), then
-    /// remove the non-desired. Use this as a periodic safety net: the incremental [`reconcile`]
-    /// trusts our `installed` bookkeeping, but the **kernel can flush our routes out from under
-    /// us** — when a link goes down it silently drops the routes whose next-hop lived on that
-    /// link. Our bookkeeping still says "installed", so the incremental path never restores them
-    /// after the link heals (and the engine, whose field may not have drained during a brief
-    /// flap, never signals a change). Periodically re-asserting the full desired set restores any
-    /// kernel-flushed route within one period, at the cost of REPLACE-ing present routes (a cheap
-    /// near-no-op in the kernel).
-    pub async fn reconcile_full(&mut self, desired: &[RouteIntent]) -> ReconcileStats {
-        self.reconcile_inner(desired, true).await
-    }
-
-    async fn reconcile_inner(&mut self, desired: &[RouteIntent], force: bool) -> ReconcileStats {
         let mut stats = ReconcileStats::default();
         // Index desired by prefix.
         let desired_map: HashMap<Prefix, &RouteIntent> =
             desired.iter().map(|r| (r.prefix, r)).collect();
 
-        // Add or replace new/changed routes (or, when `force`, every desired route — see
-        // `reconcile_full`: a REPLACE restores kernel-flushed routes our bookkeeping still claims).
+        // Add or replace new/changed routes.
         for (&prefix, &intent) in &desired_map {
-            let changed = match self.installed.get(&prefix) {
+            let needs_install = match self.installed.get(&prefix) {
                 Some(existing) => existing != intent,
                 None => true,
             };
-            if changed || force {
-                if changed {
-                    tracing::info!(
-                        "fib: install {}/{} via {} nexthop(s)",
-                        prefix.addr,
-                        prefix.len,
-                        intent.nexthops.len(),
-                    );
-                } else {
-                    // Forced periodic re-assert of an unchanged route — quiet (REPLACE no-op
-                    // unless the kernel had flushed it). Avoids info-log spam every period.
-                    tracing::debug!("fib: re-assert {}/{}", prefix.addr, prefix.len);
-                }
+            if needs_install {
+                tracing::info!(
+                    "fib: install {}/{} via {} nexthop(s)",
+                    prefix.addr,
+                    prefix.len,
+                    intent.nexthops.len(),
+                );
                 match self.install_route(intent).await {
                     Ok(()) => {
                         self.installed.insert(prefix, intent.clone());
-                        // Count only genuine changes as ops; a forced re-assert of an
-                        // unchanged route is a near-no-op REPLACE, not a state change.
-                        if changed {
-                            stats.ops += 1;
-                        }
+                        stats.ops += 1;
                     }
                     Err(e) => {
                         stats.errors += 1;

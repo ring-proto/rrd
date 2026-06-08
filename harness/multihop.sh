@@ -22,11 +22,11 @@
 #   NODES=7 bash harness/multihop.sh    # 7-node line (6 hops)
 #   HEAL_WAIT=40 bash harness/multihop.sh   # override any timeout via env
 #
-# Reconvergence is fast (a controlled cut/heal recovers in ~1-2s). The healed-link route is
-# restored by the daemon's periodic full FIB re-assert (the kernel flushes routes via a downed
-# link; the reconciler re-asserts the desired set every couple of seconds so a kernel-flushed
-# route never lingers after a heal). Waits below are polled (wait_ping returns the instant the
-# path is up) with a little margin for the multicast re-join.
+# Reconvergence is fast (a controlled cut/heal recovers in ~1-2s). The daemon does event-based RIB
+# management: a netlink link-down event drops that link's neighbours so the engine withdraws/reroutes
+# at once (and its bookkeeping matches the kernel, which flushes the routes); link-up + re-discovery
+# re-installs them. Waits below are polled (wait_ping returns the instant the path is up) with a
+# little margin for the multicast re-join.
 
 set -u
 

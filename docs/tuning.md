@@ -87,11 +87,13 @@ the shipped scales the relaxation is not the bottleneck.
 
 Two implementation details keep failover prompt:
 
-- **Kernel-flush re-assert.** When a link goes down the kernel silently flushes the routes whose
-  next-hop lived on it. The FIB reconciler trusts its own bookkeeping for the cheap incremental
-  path, so it re-asserts the *full* desired set every couple of seconds (idempotent `REPLACE`) to
-  restore any kernel-flushed route after a heal. Without this, a node adjacent to a flap could
-  keep a stale "installed" record and never re-install the route the kernel dropped.
+- **Event-based RIB management.** The daemon subscribes to netlink link-state events. When a link
+  goes down it drops that interface's neighbours from its RIB, so the engine *immediately* reroutes
+  or withdraws the affected destinations — and the daemon's view stays consistent with the kernel,
+  which flushes (admin-down) or deadens (carrier-down) those routes. When the link comes back up,
+  normal neighbour re-discovery and the reconcile re-install them. There is no FIB polling: a downed
+  link's routes are removed, not re-asserted against. (Without this, a node adjacent to a flap could
+  keep a stale "installed" record and never re-install the route the kernel dropped.)
 - **Multicast re-join.** A flapped interface loses its IPv6 multicast membership; the daemon
   re-joins on a ~1 s timer, so neighbour discovery across a healed link resumes within ~1 s.
 

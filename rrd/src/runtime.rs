@@ -75,13 +75,6 @@ pub struct RibSnapshot {
 /// Wall-clock period between periodic structured status log lines.
 const STATUS_LOG_PERIOD: std::time::Duration = std::time::Duration::from_secs(5);
 
-/// How often to force a FULL FIB re-assert (re-install every desired route) regardless of the
-/// dirty-check. The kernel silently flushes our routes when a link goes down; our bookkeeping
-/// still claims them installed, so the incremental reconcile never restores them after a heal.
-/// A periodic full re-assert (idempotent REPLACE) bounds the time a kernel-flushed route stays
-/// missing to one period. See `FibReconciler::reconcile_full`.
-const FULL_RECONCILE_PERIOD: std::time::Duration = std::time::Duration::from_secs(2);
-
 /// Runtime command for destinations dynamically originated by this node.
 #[derive(Clone, Debug)]
 pub enum LocalOriginCommand {
@@ -288,6 +281,40 @@ impl<T: Transport> Daemon<T> {
         }
     }
 
+    /// React to a netlink link-state transition (event-based RIB management).
+    ///
+    /// On link-DOWN: drop every neighbour learned on that interface from the engine and the
+    /// `(iface, src)` maps. The kernel has already flushed (admin-down) or deadened (carrier-down)
+    /// the routes whose next-hop lived on that link, so dropping the neighbours makes the engine
+    /// withdraw/reroute those destinations on the next step — keeping our `installed` bookkeeping
+    /// in step with the kernel (no stale "installed" record to leave a route un-restored) AND
+    /// severing/rerouting promptly instead of waiting for the silent neighbour's conductance to
+    /// age out. On link-UP: nothing to do here — normal multicast re-join + ingest re-discovers
+    /// the neighbours and the reconcile re-installs the routes.
+    fn handle_link_event(&mut self, ev: crate::linkmon::LinkEvent) {
+        if ev.up {
+            tracing::info!(iface = ev.ifindex, "link up — awaiting neighbour re-discovery");
+            return;
+        }
+        let dropped: Vec<NeighborId> = self
+            .addr_by_neighbor
+            .iter()
+            .filter(|(_, (iface, _))| *iface == ev.ifindex)
+            .map(|(nid, _)| *nid)
+            .collect();
+        for nid in &dropped {
+            self.engine.drop_neighbor(*nid);
+            if let Some(addr) = self.addr_by_neighbor.remove(nid) {
+                self.neighbor_by_addr.remove(&addr);
+            }
+        }
+        tracing::info!(
+            iface = ev.ifindex,
+            dropped = dropped.len(),
+            "link down — dropped its neighbours from the RIB (prompt reroute/withdraw)"
+        );
+    }
+
     /// Build a RIB snapshot from the engine's current desired_routes.
     ///
     /// Thin wrapper that materialises `desired_routes` once and delegates to
@@ -354,12 +381,17 @@ impl<T: Transport> Daemon<T> {
         // Avoid tick bursting after a long sleep.
         interval.set_missed_tick_behavior(time::MissedTickBehavior::Skip);
 
+        // Event-based RIB management: a netlink link-state monitor lets us react to a link
+        // going down (drop its neighbours from the RIB, so the engine reroutes/withdraws at
+        // once and our bookkeeping matches the kernel's flushed routes) and coming back up
+        // (re-discovery + reconcile re-installs). With this there is nothing to "re-assert".
+        let mut link_rx = crate::linkmon::spawn(self.cfg.ifaces.clone());
+        let mut link_closed = false;
+
         // Periodic status-log bookkeeping.
         let mut last_status = self.start.elapsed();
         let mut prev_rx: u64 = 0;
         let mut prev_decode: u64 = 0;
-        // Last wall-clock instant we forced a FULL FIB re-assert (kernel-flush safety net).
-        let mut last_full_reconcile = self.start.elapsed();
 
         loop {
             tokio::select! {
@@ -391,29 +423,24 @@ impl<T: Transport> Daemon<T> {
                     // double iteration of the destination table).
                     let desired: Vec<DesiredRoute> = self.engine.desired_routes(now).collect();
 
-                    // FIB reconcile on change (#13) — a cheap Vec comparison in steady state,
-                    // no netlink round-trip and no `.await`, so an unchanged route set never
-                    // yields the select! loop on the FIB path (mitigating the inline-await
-                    // stall, #14). PLUS a periodic FULL re-assert: the kernel flushes our routes
-                    // when a link goes down, but our bookkeeping still claims them installed, so
-                    // the dirty-check alone would never restore a kernel-flushed route after a
-                    // heal. Forcing a full re-assert every FULL_RECONCILE_PERIOD bounds that gap.
+                    // FIB reconcile ONLY when the canonical intent set changed since the last
+                    // reconcile (#13). In steady state this is a cheap Vec comparison with no
+                    // netlink round-trip and no `.await`, so an unchanged route set never yields
+                    // the select! loop on the FIB path (mitigating the inline-await stall, #14).
+                    // The reconciler's `installed` bookkeeping stays consistent with the kernel
+                    // because the link-state monitor drops a downed link's neighbours from the
+                    // RIB (so the engine withdraws those routes here, and the reconcile reaps the
+                    // matching `installed` entries) — there is no kernel-flushed-but-claimed route
+                    // to re-assert.
                     if self.fib.is_some() {
                         let mut intents = self.build_route_intents_from(&desired);
                         canonicalize_intents(&mut intents);
-                        let elapsed = self.start.elapsed();
-                        let force_full =
-                            elapsed.saturating_sub(last_full_reconcile) >= FULL_RECONCILE_PERIOD;
-                        if force_full || intents != self.last_intents {
+                        if intents != self.last_intents {
                             // `build_route_intents_from` (an immutable borrow of `self`) has
                             // returned an owned Vec, so taking the `&mut self.fib` borrow only
                             // now is sound; it ends before the cumulative-counter updates below.
                             let stats = if let Some(fib) = self.fib.as_mut() {
-                                if force_full {
-                                    fib.reconcile_full(&intents).await
-                                } else {
-                                    fib.reconcile(&intents).await
-                                }
+                                fib.reconcile(&intents).await
                             } else {
                                 crate::fib::ReconcileStats::default()
                             };
@@ -426,9 +453,6 @@ impl<T: Transport> Daemon<T> {
                             // the idempotent "retry on next tick" contract despite the skip (#13).
                             if stats.errors == 0 {
                                 self.last_intents = intents;
-                            }
-                            if force_full {
-                                last_full_reconcile = elapsed;
                             }
                         }
                     }
@@ -473,6 +497,12 @@ impl<T: Transport> Daemon<T> {
                     match cmd {
                         Some(cmd) => self.handle_local_origin_command(cmd),
                         None => self.local_origin_closed = true,
+                    }
+                }
+                ev = link_rx.recv(), if !link_closed => {
+                    match ev {
+                        Some(ev) => self.handle_link_event(ev),
+                        None => link_closed = true,
                     }
                 }
                 _ = &mut shutdown => {
