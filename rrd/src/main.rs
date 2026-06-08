@@ -13,6 +13,13 @@ use tracing_subscriber::EnvFilter;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    // Peel off the `lab` subcommand before the daemon's flat CLI sees it, so the
+    // daemon invocation (`rrd --prefix … --iface …`) is completely untouched.
+    let argv: Vec<String> = std::env::args().collect();
+    if argv.get(1).map(String::as_str) == Some("lab") {
+        return rrd::lab::cli::run(&argv[2..]);
+    }
+
     // Initialise tracing with an env-filter defaulting to `info`.
     tracing_subscriber::fmt()
         .with_env_filter(

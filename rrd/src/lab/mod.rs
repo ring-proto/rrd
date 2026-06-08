@@ -3,7 +3,10 @@
 //! tasks add command parsing, a script runner, rendering, and orchestration
 //! backends on top.
 
+pub mod app;
+pub mod cli;
 pub mod command;
 pub mod runner;
 pub mod state;
 pub mod topology;
+pub mod ui;
