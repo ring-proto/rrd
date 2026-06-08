@@ -72,6 +72,14 @@ impl Fabric {
     /// a random phase in [0, tick) so the schedule is genuinely asynchronous.
     pub fn build(n: usize, links: &[LinkSpec], skews: &[i64], cfg: Config, seed: u64) -> Self {
         assert_eq!(skews.len(), n, "one skew per node");
+        for (i, ls) in links.iter().enumerate() {
+            assert!(
+                ls.g.is_finite() && ls.g > 0.0,
+                "LinkSpec[{}] has invalid conductance g={} (must be finite and > 0)",
+                i,
+                ls.g
+            );
+        }
         let rng = Rng::new(seed);
         let base = clock_base(cfg.tick);
         let tick_nanos = cfg.tick.as_nanos() as i128;
@@ -349,5 +357,39 @@ mod tests {
         fab.kill_node(1); // node 1 dies; stops asserting its self-pin
         fab.run_ticks(400);
         assert!(!fab.is_routable(0, 1), "0 severs the dead destination 1");
+    }
+
+    // ── guard #20: LinkSpec with invalid g panics loudly ─────────────────
+
+    #[test]
+    #[should_panic(expected = "invalid conductance")]
+    fn link_spec_g_zero_panics() {
+        let cfg = Config::default();
+        let links = [LinkSpec { a: 0, b: 1, g: 0.0, delay_ticks: 1.0, loss: 0.0 }];
+        let _fab = Fabric::build_aligned(2, &links, cfg, 1);
+    }
+
+    #[test]
+    #[should_panic(expected = "invalid conductance")]
+    fn link_spec_g_negative_panics() {
+        let cfg = Config::default();
+        let links = [LinkSpec { a: 0, b: 1, g: -1.0, delay_ticks: 1.0, loss: 0.0 }];
+        let _fab = Fabric::build_aligned(2, &links, cfg, 1);
+    }
+
+    #[test]
+    #[should_panic(expected = "invalid conductance")]
+    fn link_spec_g_nan_panics() {
+        let cfg = Config::default();
+        let links = [LinkSpec { a: 0, b: 1, g: f64::NAN, delay_ticks: 1.0, loss: 0.0 }];
+        let _fab = Fabric::build_aligned(2, &links, cfg, 1);
+    }
+
+    #[test]
+    fn link_spec_g_positive_works() {
+        let cfg = Config::default();
+        let links = [LinkSpec { a: 0, b: 1, g: 2.5, delay_ticks: 1.0, loss: 0.0 }];
+        let fab = Fabric::build_aligned(2, &links, cfg, 1);
+        assert_eq!(fab.n(), 2);
     }
 }

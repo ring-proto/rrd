@@ -50,6 +50,7 @@ pub struct Engine {
 
 impl Engine {
     pub fn new(id: RouterId, prefix: Prefix, cfg: Config, policy: ForwardingPolicy) -> Self {
+        debug_assert!(cfg.kappa > 0.0, "kappa must be > 0 for the screened M-matrix");
         let mut e = Engine {
             id: id.clone(),
             cfg,
@@ -139,7 +140,11 @@ impl Engine {
                 continue; // our own field is pinned locally
             }
             if let Some(d) = self.intern_dest(now, e.dest.clone(), e.prefix) {
-                self.neighbors.get_mut(&from).unwrap().pot[d] = e.pot;
+                // Clamp to [0, f0]: the max principle bounds legitimate f ≤ F0; a liar
+                // advertising pot=1e9 would otherwise become a false global maximum and hijack
+                // the gradient toward itself. decode() already rejects negative/NaN pot.
+                let pot = e.pot.clamp(0.0, self.cfg.f0);
+                self.neighbors.get_mut(&from).unwrap().pot[d] = pot;
                 let v = age(self.cfg.alpha, e.vit, transit);
                 if v > self.vit[d] {
                     self.vit[d] = v;
@@ -158,7 +163,13 @@ impl Engine {
 
     /// Override a neighbour's link conductance `g` (bandwidth). Used to express per-link capacity;
     /// defaults to `cfg.d` at `add_neighbor`.
+    ///
+    /// Non-positive or non-finite values are silently ignored (no-op): they would corrupt `gsum`
+    /// and the current-split sign, so the neighbour retains its prior conductance.
     pub fn set_neighbor_conductance(&mut self, n: NeighborId, g: f64) {
+        if !g.is_finite() || g <= 0.0 {
+            return; // no-op: guard #20 — reject non-positive/non-finite conductance
+        }
         if let Some(p) = self.neighbors.get_mut(&n) {
             p.g = g;
         }
@@ -1039,6 +1050,154 @@ mod tests {
             a.step(cfg.tick * k);
         }
         assert_eq!(a.charge(), 0.0);
+    }
+
+    // ── guard #20: set_neighbor_conductance no-op for invalid g ──────────
+
+    #[test]
+    fn set_conductance_zero_is_noop() {
+        let cfg = Config::default();
+        let mut e = Engine::new(RouterId::from("a"), px(1), cfg, Default::default());
+        e.add_neighbor(NeighborId(1));
+        // Set a valid g first, then try to corrupt it with 0.
+        e.set_neighbor_conductance(NeighborId(1), 3.0);
+        e.set_neighbor_conductance(NeighborId(1), 0.0); // must be no-op
+        // Verify: ingest a message with hears=[a] and step; the field should
+        // reflect g=3.0 not g=0.0 (if it were 0 the field would compute to 0).
+        let msg = Message {
+            from: RouterId::from("n1"),
+            hears: vec![RouterId::from("a")],
+            delta: vec![Entry {
+                dest: RouterId::from("b"),
+                prefix: px(2),
+                pot: cfg.f0,
+                vit: 1.0,
+            }],
+        };
+        for k in 0..5u32 {
+            e.ingest(cfg.tick * k, NeighborId(1), &msg);
+            e.step(cfg.tick * k);
+        }
+        // With g=3.0 the field is non-zero; with g=0.0 it would be 0.
+        let f = e.peek_pot(&RouterId::from("b")).unwrap();
+        assert!(f > 0.0, "conductance was corrupted by g=0 set (f={f})");
+    }
+
+    #[test]
+    fn set_conductance_negative_is_noop() {
+        let cfg = Config::default();
+        let mut e = Engine::new(RouterId::from("a"), px(1), cfg, Default::default());
+        e.add_neighbor(NeighborId(1));
+        e.set_neighbor_conductance(NeighborId(1), 2.0);
+        e.set_neighbor_conductance(NeighborId(1), -1.0); // must be no-op
+        let msg = Message {
+            from: RouterId::from("n1"),
+            hears: vec![RouterId::from("a")],
+            delta: vec![Entry { dest: RouterId::from("b"), prefix: px(2), pot: cfg.f0, vit: 1.0 }],
+        };
+        for k in 0..5u32 {
+            e.ingest(cfg.tick * k, NeighborId(1), &msg);
+            e.step(cfg.tick * k);
+        }
+        assert!(e.peek_pot(&RouterId::from("b")).unwrap() > 0.0, "g=-1 must not corrupt conductance");
+    }
+
+    #[test]
+    fn set_conductance_nan_is_noop() {
+        let cfg = Config::default();
+        let mut e = Engine::new(RouterId::from("a"), px(1), cfg, Default::default());
+        e.add_neighbor(NeighborId(1));
+        e.set_neighbor_conductance(NeighborId(1), 2.0);
+        e.set_neighbor_conductance(NeighborId(1), f64::NAN); // must be no-op
+        let msg = Message {
+            from: RouterId::from("n1"),
+            hears: vec![RouterId::from("a")],
+            delta: vec![Entry { dest: RouterId::from("b"), prefix: px(2), pot: cfg.f0, vit: 1.0 }],
+        };
+        for k in 0..5u32 {
+            e.ingest(cfg.tick * k, NeighborId(1), &msg);
+            e.step(cfg.tick * k);
+        }
+        assert!(e.peek_pot(&RouterId::from("b")).unwrap() > 0.0, "g=NaN must not corrupt conductance");
+    }
+
+    #[test]
+    fn set_conductance_inf_is_noop() {
+        let cfg = Config::default();
+        let mut e = Engine::new(RouterId::from("a"), px(1), cfg, Default::default());
+        e.add_neighbor(NeighborId(1));
+        e.set_neighbor_conductance(NeighborId(1), 2.0);
+        e.set_neighbor_conductance(NeighborId(1), f64::INFINITY); // must be no-op
+        let msg = Message {
+            from: RouterId::from("n1"),
+            hears: vec![RouterId::from("a")],
+            delta: vec![Entry { dest: RouterId::from("b"), prefix: px(2), pot: cfg.f0, vit: 1.0 }],
+        };
+        for k in 0..5u32 {
+            e.ingest(cfg.tick * k, NeighborId(1), &msg);
+            e.step(cfg.tick * k);
+        }
+        assert!(e.peek_pot(&RouterId::from("b")).unwrap() > 0.0, "g=Inf must not corrupt conductance");
+    }
+
+    #[test]
+    fn set_conductance_positive_sets_it() {
+        let cfg = Config::default();
+        let mut e = Engine::new(RouterId::from("a"), px(1), cfg, Default::default());
+        e.add_neighbor(NeighborId(1));
+        e.set_neighbor_conductance(NeighborId(1), 5.0);
+        let msg = Message {
+            from: RouterId::from("n1"),
+            hears: vec![RouterId::from("a")],
+            delta: vec![Entry { dest: RouterId::from("b"), prefix: px(2), pot: cfg.f0, vit: 1.0 }],
+        };
+        for k in 0..5u32 {
+            e.ingest(cfg.tick * k, NeighborId(1), &msg);
+            e.step(cfg.tick * k);
+        }
+        // With g=5: f = 5*f0 / (5 + kappa) — should be high.
+        let f = e.peek_pot(&RouterId::from("b")).unwrap();
+        let expected = 5.0 * cfg.f0 / (5.0 + cfg.kappa);
+        assert!((f - expected).abs() < 1e-6, "f={f}, expected={expected}");
+    }
+
+    // ── guard #18: ingest clamps pot to [0, f0] ──────────────────────────
+
+    #[test]
+    fn ingest_clamps_oversized_pot_to_f0() {
+        let cfg = Config::default();
+        let mut a = Engine::new(RouterId::from("a"), px(1), cfg, Default::default());
+        a.add_neighbor(NeighborId(1));
+
+        // Adversarial pot of 1e9 — far above F0=1.0
+        let msg = Message {
+            from: RouterId::from("n1"),
+            hears: vec![RouterId::from("a")],
+            delta: vec![Entry {
+                dest: RouterId::from("b"),
+                prefix: px(2),
+                pot: 1e9,
+                vit: 1.0,
+            }],
+        };
+        for k in 0..5u32 {
+            a.ingest(cfg.tick * k, NeighborId(1), &msg);
+            a.step(cfg.tick * k);
+        }
+
+        // The resulting f must be ≤ f0 (the clamp is in effect)
+        let f = a.peek_pot(&RouterId::from("b")).unwrap();
+        assert!(
+            f <= cfg.f0 + 1e-9,
+            "pot was not clamped: f={f} > f0={}",
+            cfg.f0
+        );
+        // Verify it's actually using clamped value (equivalent to pot=f0 scenario)
+        let expected = cfg.d * cfg.f0 / (cfg.d + cfg.kappa);
+        assert!(
+            (f - expected).abs() < 1e-6,
+            "clamped f={f} should match d*f0/(d+kappa)={expected}"
+        );
     }
 
     #[test]
