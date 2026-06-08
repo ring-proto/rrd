@@ -21,6 +21,8 @@ use std::collections::HashMap;
 use std::future::Future;
 use std::net::Ipv6Addr;
 use std::time::Instant;
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::Arc;
 use tokio::sync::{mpsc, watch};
 use tokio::time;
 
@@ -90,22 +92,25 @@ pub struct Daemon<T: Transport> {
     prefix_to_rid: HashMap<Prefix, RouterId>,
     next_nid: u32,
     rib_tx: watch::Sender<RibSnapshot>,
-    /// FIB reconciler; None when `--no-fib` is set or netlink connect failed.
-    fib: Option<FibReconciler>,
     local_origin_rx: mpsc::UnboundedReceiver<LocalOriginCommand>,
     local_origin_closed: bool,
     /// Cumulative datagrams handed to the daemon (decoded or not).
     datagrams_rx: u64,
     /// Cumulative wire-decode failures.
     decode_errors: u64,
-    /// Cumulative FIB operations applied (install + withdraw).
-    fib_ops: u64,
-    /// Cumulative FIB operation failures.
-    fib_errors: u64,
+    /// Cumulative FIB operations applied (install + withdraw). Shared with the FIB task (#14),
+    /// which owns the reconciler and updates these so a slow netlink op never blocks the loop.
+    fib_ops: Arc<AtomicU64>,
+    /// Cumulative FIB operation failures (shared with the FIB task).
+    fib_errors: Arc<AtomicU64>,
+    /// Routes currently installed in the kernel, published by the FIB task for the `routes` gauge.
+    fib_installed: Arc<AtomicUsize>,
+    /// Whether a FIB task is running (false under `--no-fib` or a failed netlink connect).
+    fib_active: bool,
     /// Cumulative neighbours reclaimed by the engine's prune pass.
     neighbors_pruned: u64,
-    /// Last canonicalised intent set handed to `fib.reconcile`, used as the
-    /// dirty-check so a steady-state tick skips the netlink round-trip (#13).
+    /// Last canonicalised intent set handed to the FIB task, used as the dirty-check so a
+    /// steady-state tick sends nothing (#13).
     last_intents: Vec<RouteIntent>,
 }
 
@@ -145,13 +150,14 @@ impl<T: Transport> Daemon<T> {
             prefix_to_rid,
             next_nid: 0,
             rib_tx,
-            fib: None,
             local_origin_rx,
             local_origin_closed: false,
             datagrams_rx: 0,
             decode_errors: 0,
-            fib_ops: 0,
-            fib_errors: 0,
+            fib_ops: Arc::new(AtomicU64::new(0)),
+            fib_errors: Arc::new(AtomicU64::new(0)),
+            fib_installed: Arc::new(AtomicUsize::new(0)),
+            fib_active: false,
             neighbors_pruned: 0,
             last_intents: Vec::new(),
         };
@@ -336,9 +342,10 @@ impl<T: Transport> Daemon<T> {
             })
             .collect();
         tracing::debug!("RIB snapshot: {} routable dests", routable.len());
-        let routes = match &self.fib {
-            Some(fib) => fib.installed_count(),
-            None => routable.len(),
+        let routes = if self.fib_active {
+            self.fib_installed.load(Ordering::Relaxed)
+        } else {
+            routable.len()
         };
         let metrics = Metrics {
             dests: self.engine.dest_count(),
@@ -346,8 +353,8 @@ impl<T: Transport> Daemon<T> {
             routes,
             datagrams_rx_total: self.datagrams_rx,
             decode_errors_total: self.decode_errors,
-            fib_ops_total: self.fib_ops,
-            fib_errors_total: self.fib_errors,
+            fib_ops_total: self.fib_ops.load(Ordering::Relaxed),
+            fib_errors_total: self.fib_errors.load(Ordering::Relaxed),
             neighbors_pruned_total: self.neighbors_pruned,
         };
         RibSnapshot { routable, metrics }
@@ -355,12 +362,29 @@ impl<T: Transport> Daemon<T> {
 
     /// Run the daemon until `shutdown` resolves.
     pub async fn run(mut self, mut shutdown: impl Future<Output = ()> + Unpin) {
-        // Connect to the kernel FIB unless --no-fib is set.
+        // Connect to the kernel FIB unless --no-fib is set, and run the reconciler in its OWN
+        // task (#14) fed by a `watch` channel. The tick loop only ever does a cheap, non-blocking
+        // `watch::send` of the latest intent set, so a slow/blocked netlink reconcile can never
+        // stall `transport.recv()` (which would otherwise spuriously age out neighbours). The task
+        // owns the reconciler; cumulative counters + the installed-route count flow back via the
+        // shared atomics for the metrics. `fib_tx = None` ⇒ no FIB task (--no-fib or connect fail).
+        let mut fib_tx: Option<watch::Sender<Vec<RouteIntent>>> = None;
+        let mut fib_handle: Option<tokio::task::JoinHandle<()>> = None;
         if !self.cfg.no_fib {
             match FibReconciler::connect().await {
                 Ok(fib) => {
                     tracing::info!("fib: kernel FIB install ON (proto 155/ring)");
-                    self.fib = Some(fib);
+                    let (tx, rx) = watch::channel(Vec::<RouteIntent>::new());
+                    let handle = tokio::spawn(fib_task(
+                        fib,
+                        rx,
+                        self.fib_ops.clone(),
+                        self.fib_errors.clone(),
+                        self.fib_installed.clone(),
+                    ));
+                    fib_tx = Some(tx);
+                    fib_handle = Some(handle);
+                    self.fib_active = true;
                 }
                 Err(e) => {
                     tracing::warn!(
@@ -420,37 +444,21 @@ impl<T: Transport> Daemon<T> {
                     // double iteration of the destination table).
                     let desired: Vec<DesiredRoute> = self.engine.desired_routes(now).collect();
 
-                    // FIB reconcile ONLY when the canonical intent set changed since the last
-                    // reconcile (#13). In steady state this is a cheap Vec comparison with no
-                    // netlink round-trip and no `.await`, so an unchanged route set never yields
-                    // the select! loop on the FIB path (mitigating the inline-await stall, #14).
-                    // The reconciler's `installed` bookkeeping stays consistent with the kernel
-                    // because the link-state monitor drops a downed link's neighbours from the
-                    // RIB (so the engine withdraws those routes here, and the reconcile reaps the
-                    // matching `installed` entries) — there is no kernel-flushed-but-claimed route
-                    // to re-assert.
-                    if self.fib.is_some() {
+                    // Hand the latest intent set to the FIB task ONLY when it changed (#13: a
+                    // cheap Vec comparison in steady state). The send is non-blocking and the
+                    // `watch` keeps only the latest, so rapid changes coalesce and the netlink
+                    // reconcile never runs on this loop (#14). The task retries failed ops on its
+                    // own; the dirty-check is purely a "don't re-send the same thing" optimisation.
+                    // Bookkeeping stays consistent with the kernel because the link-state monitor
+                    // drops a downed link's neighbours from the RIB (the engine withdraws those
+                    // routes here, the task's reconcile reaps the matching `installed` entries) —
+                    // no kernel-flushed-but-claimed route to re-assert.
+                    if let Some(tx) = &fib_tx {
                         let mut intents = self.build_route_intents_from(&desired);
                         canonicalize_intents(&mut intents);
                         if intents != self.last_intents {
-                            // `build_route_intents_from` (an immutable borrow of `self`) has
-                            // returned an owned Vec, so taking the `&mut self.fib` borrow only
-                            // now is sound; it ends before the cumulative-counter updates below.
-                            let stats = if let Some(fib) = self.fib.as_mut() {
-                                fib.reconcile(&intents).await
-                            } else {
-                                crate::fib::ReconcileStats::default()
-                            };
-                            self.fib_ops += stats.ops as u64;
-                            self.fib_errors += stats.errors as u64;
-                            // Only memoise the desired set as "applied" when the reconcile FULLY
-                            // succeeded. If any op failed, leave `last_intents` stale so the next
-                            // tick re-attempts it (the reconciler diffs against its own
-                            // `installed` map, so it retries only the failed ops) — preserving
-                            // the idempotent "retry on next tick" contract despite the skip (#13).
-                            if stats.errors == 0 {
-                                self.last_intents = intents;
-                            }
+                            let _ = tx.send(intents.clone());
+                            self.last_intents = intents;
                         }
                     }
 
@@ -509,11 +517,49 @@ impl<T: Transport> Daemon<T> {
             }
         }
 
-        // Graceful shutdown: withdraw all installed routes.
-        if let Some(mut fib) = self.fib.take() {
-            fib.withdraw_all().await;
+        // Graceful shutdown: drop the sender so the FIB task's `watch::changed()` errors, then
+        // await the task — it withdraws all installed routes before exiting.
+        drop(fib_tx);
+        if let Some(handle) = fib_handle {
+            let _ = handle.await;
         }
     }
+}
+
+/// The FIB reconcile loop, run in its own task (#14) so a slow/blocked netlink op never stalls the
+/// daemon's `select!` loop. Reconciles to the latest intent set received on `rx` (the `watch`
+/// coalesces rapid changes); retries on its own short timer while the last reconcile had errors
+/// (preserving the reconciler's idempotent retry contract); and publishes cumulative ops/errors
+/// and the installed-route count back through the shared atomics. On the sender being dropped
+/// (daemon shutdown) it withdraws every installed route and exits.
+async fn fib_task(
+    mut fib: FibReconciler,
+    mut rx: watch::Receiver<Vec<RouteIntent>>,
+    ops: Arc<AtomicU64>,
+    errors: Arc<AtomicU64>,
+    installed: Arc<AtomicUsize>,
+) {
+    /// Delay before re-attempting a reconcile that had failures.
+    const RETRY_DELAY: std::time::Duration = std::time::Duration::from_millis(250);
+    let mut retry = false;
+    loop {
+        tokio::select! {
+            changed = rx.changed() => {
+                if changed.is_err() {
+                    break; // sender dropped → shutdown
+                }
+            }
+            _ = tokio::time::sleep(RETRY_DELAY), if retry => {}
+        }
+        let intents = rx.borrow_and_update().clone();
+        let stats = fib.reconcile(&intents).await;
+        ops.fetch_add(stats.ops as u64, Ordering::Relaxed);
+        errors.fetch_add(stats.errors as u64, Ordering::Relaxed);
+        installed.store(fib.installed_count(), Ordering::Relaxed);
+        retry = stats.errors > 0;
+    }
+    fib.withdraw_all().await;
+    installed.store(fib.installed_count(), Ordering::Relaxed);
 }
 
 // ─────────────────────────────────── tests ───────────────────────────────────
