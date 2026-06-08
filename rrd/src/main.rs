@@ -56,17 +56,21 @@ async fn daemon_main() -> anyhow::Result<()> {
     let control_socket = daemon_cfg.control_socket.clone();
 
     // Construct the daemon. `Daemon::new_controlled` returns `(daemon, rib_rx, origin_tx)`.
-    // We drop the `rib_rx` here because the main binary doesn't query the RIB directly;
-    // it is kept alive for the lifetime of the daemon's sender inside `run`.
-    let (daemon, _rib_rx, origin_tx) = Daemon::new_controlled(daemon_cfg, transport);
+    // The `rib_rx` is handed to the control socket so `status` queries can read the
+    // latest published metrics/RIB.
+    let (daemon, rib_rx, origin_tx) = Daemon::new_controlled(daemon_cfg, transport);
 
     if let Some(path) = control_socket {
         tracing::info!(path = %path.display(), "rrd control socket enabled");
         tokio::spawn(async move {
-            if let Err(error) = run_control_socket(path, origin_tx).await {
+            if let Err(error) = run_control_socket(path, origin_tx, rib_rx).await {
                 tracing::warn!(%error, "rrd control socket stopped");
             }
         });
+    } else {
+        // No control socket: the RIB receiver has no consumer. Drop it explicitly
+        // so it doesn't read as an accidental unused binding.
+        drop(rib_rx);
     }
 
     // Build the shutdown future. `tokio::signal::ctrl_c()` returns a `!Unpin`

@@ -30,14 +30,16 @@ struct WireRequest {
 pub async fn run_control_socket(
     path: impl Into<PathBuf>,
     tx: mpsc::UnboundedSender<LocalOriginCommand>,
+    rib_rx: tokio::sync::watch::Receiver<crate::runtime::RibSnapshot>,
 ) -> io::Result<()> {
     let path = path.into();
     let listener = bind_socket(&path)?;
     loop {
         let (stream, _) = listener.accept().await?;
         let tx = tx.clone();
+        let rib_rx = rib_rx.clone();
         tokio::spawn(async move {
-            if let Err(error) = handle_stream(stream, tx).await {
+            if let Err(error) = handle_stream(stream, tx, rib_rx).await {
                 tracing::warn!(%error, "control socket request failed");
             }
         });
@@ -92,20 +94,103 @@ pub async fn send_control_request(
     Err(last_error.unwrap_or_else(|| io::Error::other("control socket unavailable")))
 }
 
+/// A typed view of the daemon's `status` reply over the control socket. The
+/// reply's `routable` array is ignored by serde here.
+#[derive(Debug, Clone, serde::Deserialize)]
+pub struct StatusReply {
+    pub dests: usize,
+    pub neighbors: usize,
+    pub routes: usize,
+    pub datagrams_rx: u64,
+    pub decode_errors: u64,
+    pub fib_ops: u64,
+    pub fib_errors: u64,
+}
+
+/// Query the daemon's status over its control socket.
+pub async fn query_status(path: impl AsRef<Path>) -> io::Result<StatusReply> {
+    let mut last_error = None;
+    for _ in 0..50 {
+        match UnixStream::connect(path.as_ref()).await {
+            Ok(mut stream) => {
+                stream.write_all(b"{\"type\":\"status\"}\n").await?;
+                let mut reader = BufReader::new(stream);
+                let mut line = String::new();
+                reader.read_line(&mut line).await?;
+                return serde_json::from_str::<StatusReply>(line.trim())
+                    .map_err(io::Error::other);
+            }
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    io::ErrorKind::NotFound | io::ErrorKind::ConnectionRefused
+                ) =>
+            {
+                last_error = Some(error);
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+            Err(error) => return Err(error),
+        }
+    }
+    Err(last_error.unwrap_or_else(|| io::Error::other("control socket unavailable")))
+}
+
 async fn handle_stream(
     stream: UnixStream,
     tx: mpsc::UnboundedSender<LocalOriginCommand>,
+    rib_rx: tokio::sync::watch::Receiver<crate::runtime::RibSnapshot>,
 ) -> io::Result<()> {
     let mut reader = BufReader::new(stream);
     let mut line = String::new();
     reader.read_line(&mut line).await?;
-    let response = match parse_wire_request(line.trim()) {
-        Ok(cmd) => match tx.send(cmd) {
-            Ok(()) => json!({"type": "ok"}),
-            Err(_) => json!({"type": "error", "error": "rrd runtime command channel is closed"}),
-        },
-        Err(error) => json!({"type": "error", "error": error}),
+    let line = line.trim();
+
+    // Peek the request type so `status` queries can be answered from the RIB
+    // watch channel without going through the add/remove command path.
+    let req_type = serde_json::from_str::<WireRequest>(line)
+        .map(|r| r.request_type)
+        .unwrap_or_default();
+
+    let response = if req_type == "status" {
+        // Extract owned values from the borrow guard and build the reply fully
+        // before any `.await`, so the guard is never held across the write.
+        let snap = rib_rx.borrow();
+        let m = &snap.metrics;
+        let routable: Vec<_> = snap
+            .routable
+            .iter()
+            .map(|(rid, p)| {
+                json!({
+                    "router_id": rid.0,
+                    "prefix": format!("{}/{}", p.addr, p.len),
+                })
+            })
+            .collect();
+        let reply = json!({
+            "type": "status",
+            "dests": m.dests,
+            "neighbors": m.neighbors,
+            "routes": m.routes,
+            "datagrams_rx": m.datagrams_rx_total,
+            "decode_errors": m.decode_errors_total,
+            "fib_ops": m.fib_ops_total,
+            "fib_errors": m.fib_errors_total,
+            "routable": routable,
+        });
+        drop(snap);
+        reply
+    } else {
+        match parse_wire_request(line) {
+            Ok(cmd) => match tx.send(cmd) {
+                Ok(()) => json!({"type": "ok"}),
+                Err(_) => {
+                    json!({"type": "error", "error": "rrd runtime command channel is closed"})
+                }
+            },
+            Err(error) => json!({"type": "error", "error": error}),
+        }
     };
+
     let mut stream = reader.into_inner();
     stream.write_all(format!("{}\n", response).as_bytes()).await
 }
