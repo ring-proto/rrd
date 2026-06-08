@@ -16,6 +16,8 @@ pub struct Config {
     pub glide: f64, // glide rate r of reg()
     pub no_retard: bool, // ablation: adopt vitality un-aged (demonstrates Thm 6.2)
     pub no_link_age: bool, // ablation: keep stale link conductance frozen (dead-relay pin)
+    pub max_dests: usize,  // hard cap on interned destinations (untrusted-intern DoS bound)
+    pub gc_dwell: f64,     // ticks a non-origin slot must stay GC-eligible before reach-ball eviction
 }
 
 impl Default for Config {
@@ -32,6 +34,8 @@ impl Default for Config {
             glide: 1.0,
             no_retard: false,
             no_link_age: false,
+            max_dests: 65_536,
+            gc_dwell: 32.0,
         }
     }
 }
@@ -66,6 +70,8 @@ mod tests {
         assert_eq!(c.crowd, 0.0); // congestion off by default
         assert!(!c.no_retard);
         assert!(!c.no_link_age);
+        assert_eq!(c.max_dests, 65_536);
+        assert_eq!(c.gc_dwell, 32.0);
     }
 
     #[test]

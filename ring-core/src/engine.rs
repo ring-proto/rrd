@@ -32,6 +32,9 @@ pub struct Engine {
     vit: Vec<f64>,
     dominant: Vec<Option<NeighborId>>,
     hops: Vec<SmallVec<[WeightedHop; 4]>>,
+    /// Per-slot last `now` at which the slot was NOT GC-eligible. Reach-ball GC evicts a
+    /// non-origin slot once it has been continuously GC-eligible for `cfg.gc_dwell` ticks.
+    gc_ok_at: Vec<Mono>,
     last_aged: Mono,
 
     neighbors: HashMap<NeighborId, Peer>,
@@ -59,6 +62,7 @@ impl Engine {
             vit: Vec::new(),
             dominant: Vec::new(),
             hops: Vec::new(),
+            gc_ok_at: Vec::new(),
             last_aged: Mono::ZERO,
             neighbors: HashMap::new(),
             kappa: cfg.kappa,
@@ -67,7 +71,10 @@ impl Engine {
             stress: 0.0,
             fbuf: Vec::new(),
         };
-        e.intern_dest(id, prefix);
+        // The primary origin always fits (ndest == 0) and is a known local origin, so it
+        // bypasses the budget; the Option can never be None here.
+        e.intern_dest(Mono::ZERO, id, prefix)
+            .expect("primary origin always interns");
         e
     }
 
@@ -79,9 +86,11 @@ impl Engine {
     /// first local origin; CNI/pod/service ownership can add more dynamically.
     pub fn add_local_origin(&mut self, dest: RouterId, prefix: Prefix) -> bool {
         let is_new = !self.local_origins.contains_key(&dest);
-        let slot = self.intern_dest(dest.clone(), prefix);
-        self.dest_prefix[slot] = prefix;
-        self.local_origins.insert(dest, prefix);
+        // Register the origin BEFORE interning so it bypasses the untrusted dest budget: a
+        // node must always be able to advertise its own (trusted) local origins.
+        self.local_origins.insert(dest.clone(), prefix);
+        self.intern_dest(self.last_aged, dest, prefix)
+            .expect("local origins bypass the dest budget");
         is_new
     }
 
@@ -129,12 +138,14 @@ impl Engine {
             if e.dest == self.id {
                 continue; // our own field is pinned locally
             }
-            let d = self.intern_dest(e.dest.clone(), e.prefix);
-            self.neighbors.get_mut(&from).unwrap().pot[d] = e.pot;
-            let v = age(self.cfg.alpha, e.vit, transit);
-            if v > self.vit[d] {
-                self.vit[d] = v;
+            if let Some(d) = self.intern_dest(now, e.dest.clone(), e.prefix) {
+                self.neighbors.get_mut(&from).unwrap().pot[d] = e.pot;
+                let v = age(self.cfg.alpha, e.vit, transit);
+                if v > self.vit[d] {
+                    self.vit[d] = v;
+                }
             }
+            // else: over budget — silently skip this entry (untrusted-intern bound).
         }
 
         let p = self.neighbors.get_mut(&from).unwrap();
@@ -151,6 +162,12 @@ impl Engine {
         if let Some(p) = self.neighbors.get_mut(&n) {
             p.g = g;
         }
+    }
+
+    /// The number of currently interned destination slots (origins + learned remotes). Bounded by
+    /// `cfg.max_dests` for untrusted entries; shrinks as reach-ball GC evicts drained dead slots.
+    pub fn dest_count(&self) -> usize {
+        self.dest_key.len()
     }
 
     /// Test/inspection helper: the retained weighted uphill set toward `dest` (descending by
@@ -208,12 +225,20 @@ impl Engine {
     /// Return the dense slot for `key`, allocating (and growing every dense vector, including
     /// each neighbour's `pot`) if it is newly learned. If the destination already exists, refresh
     /// its advertised prefix: RouterId is the stable origin identity, while Prefix is mutable
-    /// routing metadata used by FIB projection. Reach-ball GC (eviction when `f` drains below the
-    /// floor) is a later milestone; for now the index only grows.
-    fn intern_dest(&mut self, key: RouterId, prefix: Prefix) -> usize {
+    /// routing metadata used by FIB projection.
+    ///
+    /// A NEW key is refused (`None`) once the index is at `cfg.max_dests`, bounding interning from
+    /// untrusted advertisements (the untrusted-intern DoS). Local origins are trusted and bypass
+    /// the budget: an origin already present in `local_origins` is always interned. Known keys
+    /// (already interned) always succeed and just refresh their prefix.
+    fn intern_dest(&mut self, now: Mono, key: RouterId, prefix: Prefix) -> Option<usize> {
         if let Some(&s) = self.dest_slot.get(&key) {
             self.dest_prefix[s] = prefix;
-            return s;
+            return Some(s);
+        }
+        let is_origin = self.local_origins.contains_key(&key);
+        if !is_origin && self.dest_key.len() >= self.cfg.max_dests {
+            return None; // over budget: refuse this untrusted destination
         }
         let s = self.dest_key.len();
         self.dest_slot.insert(key.clone(), s);
@@ -223,11 +248,12 @@ impl Engine {
         self.vit.push(0.0);
         self.dominant.push(None);
         self.hops.push(SmallVec::new());
+        self.gc_ok_at.push(now);
         self.fbuf.push(0.0);
         for p in self.neighbors.values_mut() {
             p.pot.push(0.0);
         }
-        s
+        Some(s)
     }
 
     fn ndest(&self) -> usize {
@@ -740,6 +766,52 @@ mod tests {
             r.via.is_some(),
             "direction is still known — severance is not deletion"
         );
+    }
+
+    #[test]
+    fn dest_budget_refuses_new_untrusted_dests_but_refreshes_known() {
+        let mut cfg = Config::default();
+        cfg.max_dests = 2; // origin "a" + exactly one learned remote
+        let mut a = Engine::new(RouterId::from("a"), px(1), cfg, Default::default());
+        a.add_neighbor(NeighborId(1));
+
+        // origin occupies slot 0; learn b (slot 1) — fits.
+        let mk = |dest: &str, pot: f64| Message {
+            from: RouterId::from("n1"),
+            hears: vec![RouterId::from("a")],
+            delta: vec![Entry {
+                dest: RouterId::from(dest),
+                prefix: px(9),
+                pot,
+                vit: 1.0,
+            }],
+        };
+        a.ingest(Duration::ZERO, NeighborId(1), &mk("b", 0.9));
+        assert_eq!(a.dest_count(), 2, "origin + b");
+        assert!(a.route(Duration::ZERO, &RouterId::from("b")).is_some());
+
+        // A THIRD new dest is over budget → refused, never interned.
+        a.ingest(Duration::ZERO, NeighborId(1), &mk("c", 0.9));
+        assert_eq!(a.dest_count(), 2, "c must be refused over budget");
+        assert!(
+            a.route(Duration::ZERO, &RouterId::from("c")).is_none(),
+            "over-budget dest is never interned"
+        );
+
+        // But an already-KNOWN dest still refreshes (prefix update path) without growing.
+        let refresh = Message {
+            from: RouterId::from("n1"),
+            hears: vec![RouterId::from("a")],
+            delta: vec![Entry {
+                dest: RouterId::from("b"),
+                prefix: px(42),
+                pot: 0.8,
+                vit: 1.0,
+            }],
+        };
+        a.ingest(Duration::ZERO, NeighborId(1), &refresh);
+        assert_eq!(a.dest_count(), 2, "refresh of known dest does not grow");
+        assert!(a.route(Duration::ZERO, &RouterId::from("b")).is_some());
     }
 
     #[test]
