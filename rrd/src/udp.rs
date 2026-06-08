@@ -224,10 +224,10 @@ pub(crate) fn aggregate_send(results: &[(u32, io::Result<usize>)]) -> io::Result
     }
     // All failed — synthesise a summary error.
     let n = results.len();
-    Err(io::Error::new(
-        io::ErrorKind::Other,
-        format!("Udp6Transport: all {} interface(s) failed to send", n),
-    ))
+    Err(io::Error::other(format!(
+        "Udp6Transport: all {} interface(s) failed to send",
+        n
+    )))
 }
 
 #[async_trait::async_trait]
