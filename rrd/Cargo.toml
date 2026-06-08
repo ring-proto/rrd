@@ -13,9 +13,9 @@ path = "src/main.rs"
 [dependencies]
 ring-core = { path = "../ring-core" }
 async-trait = "0.1"
-tokio = { version = "1", features = ["rt-multi-thread", "net", "time", "sync", "signal", "macros", "io-util"] }
+tokio = { version = "1", features = ["rt-multi-thread", "net", "time", "sync", "signal", "macros", "io-util", "process"] }
 socket2 = { version = "0.5", features = ["all"] }
-nix = { version = "0.29", features = ["net", "hostname"] }
+nix = { version = "0.29", features = ["net", "hostname", "user"] }
 clap = { version = "4", features = ["derive"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }

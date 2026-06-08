@@ -4,8 +4,13 @@
 //! backends on top.
 
 pub mod app;
+pub mod backend;
 pub mod cli;
 pub mod command;
+pub mod dryrun;
+pub mod live;
+pub mod netns;
+pub mod rootless;
 pub mod runner;
 pub mod state;
 pub mod topology;

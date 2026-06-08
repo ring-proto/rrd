@@ -11,15 +11,24 @@ use rrd::runtime::Daemon;
 use rrd::udp::Udp6Transport;
 use tracing_subscriber::EnvFilter;
 
-#[tokio::main]
-async fn main() -> anyhow::Result<()> {
-    // Peel off the `lab` subcommand before the daemon's flat CLI sees it, so the
-    // daemon invocation (`rrd --prefix … --iface …`) is completely untouched.
+fn main() -> anyhow::Result<()> {
+    // Peel off the `lab` subcommand BEFORE any tokio runtime exists, so the
+    // daemon invocation (`rrd --prefix … --iface …`) is completely untouched and
+    // the lab can own its own runtime (live mode) or stay fully synchronous.
     let argv: Vec<String> = std::env::args().collect();
     if argv.get(1).map(String::as_str) == Some("lab") {
         return rrd::lab::cli::run(&argv[2..]);
     }
 
+    // Daemon path: build a multi-threaded tokio runtime and run to completion.
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .context("failed to build tokio runtime")?;
+    rt.block_on(daemon_main())
+}
+
+async fn daemon_main() -> anyhow::Result<()> {
     // Initialise tracing with an env-filter defaulting to `info`.
     tracing_subscriber::fmt()
         .with_env_filter(

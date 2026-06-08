@@ -22,6 +22,13 @@ pub fn run(args: &[String]) -> anyhow::Result<()> {
     let mut topology: Option<String> = None;
     let mut snapshot = false;
     let mut tui = false;
+    let mut live = false;
+    let mut from: Option<String> = None;
+    let mut to: Option<String> = None;
+    let mut flows: usize = 8;
+    let mut converge_secs: u64 = 8;
+    let mut tick_ms: u64 = 50;
+    let mut max_paths: u32 = 8;
 
     let mut it = args.iter();
     while let Some(a) = it.next() {
@@ -42,12 +49,79 @@ pub fn run(args: &[String]) -> anyhow::Result<()> {
             }
             "--snapshot-json" => snapshot = true,
             "--tui" => tui = true,
+            "--live" => live = true,
+            "--from" => {
+                from = Some(
+                    it.next()
+                        .ok_or_else(|| anyhow::anyhow!("--from requires a node"))?
+                        .clone(),
+                )
+            }
+            "--to" => {
+                to = Some(
+                    it.next()
+                        .ok_or_else(|| anyhow::anyhow!("--to requires a node"))?
+                        .clone(),
+                )
+            }
+            "--flows" => {
+                flows = it
+                    .next()
+                    .ok_or_else(|| anyhow::anyhow!("--flows requires a number"))?
+                    .parse()
+                    .map_err(|_| anyhow::anyhow!("--flows expects a number"))?
+            }
+            "--converge-secs" => {
+                converge_secs = it
+                    .next()
+                    .ok_or_else(|| anyhow::anyhow!("--converge-secs requires a number"))?
+                    .parse()
+                    .map_err(|_| anyhow::anyhow!("--converge-secs expects a number"))?
+            }
+            "--tick-ms" => {
+                tick_ms = it
+                    .next()
+                    .ok_or_else(|| anyhow::anyhow!("--tick-ms requires a number"))?
+                    .parse()
+                    .map_err(|_| anyhow::anyhow!("--tick-ms expects a number"))?
+            }
+            "--max-paths" => {
+                max_paths = it
+                    .next()
+                    .ok_or_else(|| anyhow::anyhow!("--max-paths requires a number"))?
+                    .parse()
+                    .map_err(|_| anyhow::anyhow!("--max-paths expects a number"))?
+            }
             "-h" | "--help" => {
                 print_help();
                 return Ok(());
             }
             other => anyhow::bail!("unknown lab arg: {other}"),
         }
+    }
+
+    // Live mode: re-exec into a user+net namespace (if needed), then drive the
+    // real rootless backend on a tokio runtime. This is the runnable payoff.
+    if live {
+        // Re-exec carries the ORIGINAL args verbatim so we land back here with
+        // RRD_LAB_LIVE_INNER=1 set and identical flags.
+        crate::lab::live::ensure_namespace(args)?;
+        let topo = match &topology {
+            Some(spec) => parse_topology_spec(spec)?,
+            None => Topology::diamond(),
+        };
+        let opts = crate::lab::live::LiveOptions {
+            topology: topo,
+            from,
+            to,
+            flows,
+            converge_secs,
+            tick_ms,
+            max_paths,
+        };
+        let rt =
+            tokio::runtime::Runtime::new().map_err(|e| anyhow::anyhow!("tokio runtime: {e}"))?;
+        return rt.block_on(crate::lab::live::run_live(opts));
     }
 
     // Build the initial state.
@@ -134,15 +208,22 @@ fn print_summary(state: &LabState) {
 
 fn print_help() {
     println!(
-        "rrd lab — interactive / headless rootless RING topology lab\n\
+        "rrd lab — interactive / headless / LIVE rootless RING topology lab\n\
          \n\
          USAGE:\n\
+         \x20 rrd lab --live [--topology <spec>] [--from N --to N --flows K]\n\
          \x20 rrd lab --tui [--topology <spec>]\n\
          \x20 rrd lab --topology <spec> [--snapshot-json]\n\
          \x20 rrd lab --script <file> [--snapshot-json]\n\
          \n\
          TOPOLOGY SPECS:\n\
          \x20 diamond | line:N | mesh:N | fat-tree:K | grid:WxH\n\
+         \n\
+         LIVE MODE (no sudo; re-execs into a user+net namespace):\n\
+         \x20 builds real netns/veth/bridge fabric, starts an rrd daemon per\n\
+         \x20 node, waits --converge-secs (default 8), then measures a multi-\n\
+         \x20 flow traffic burst --from -> --to and prints the per-leg split.\n\
+         \x20 Extra flags: --tick-ms (50) --max-paths (8) --converge-secs (8).\n\
          \n\
          Default topology is 'diamond' when none is given."
     );

@@ -1,0 +1,164 @@
+//! Live lab driver: stands up a real rootless netns topology via
+//! [`RootlessBackend`], starts an `rrd` daemon per node, waits for the field to
+//! converge, and runs a traffic-spread measurement — the runnable, visible
+//! payoff of the lab.
+//!
+//! ## Re-exec model
+//! Like the harness scripts, live mode must run inside a user+net namespace.
+//! [`ensure_namespace`] re-execs the current binary under
+//! `unshare -rmn --propagation private` with `RRD_LAB_LIVE_INNER=1` set, so the
+//! caller just runs `rrd lab --live …` with no sudo.
+
+use crate::lab::backend::LabBackend;
+use crate::lab::rootless::RootlessBackend;
+use crate::lab::topology::Topology;
+use std::time::Duration;
+
+const INNER_ENV: &str = "RRD_LAB_LIVE_INNER";
+
+/// If we're not yet inside the lab's user+net namespace, re-exec into one and
+/// never return; otherwise return `Ok(())` to continue in-namespace.
+pub fn ensure_namespace(orig_args: &[String]) -> anyhow::Result<()> {
+    if std::env::var(INNER_ENV).as_deref() == Ok("1") {
+        return Ok(());
+    }
+    // Preflight: a clear message beats a cryptic unshare failure.
+    let probe = std::process::Command::new("unshare")
+        .args(["-rmn", "--propagation", "private", "true"])
+        .status();
+    if !matches!(probe, Ok(s) if s.success()) {
+        anyhow::bail!(
+            "cannot create an unprivileged user namespace. Enable it, e.g.:\n  \
+             sysctl -w kernel.apparmor_restrict_unprivileged_userns=0"
+        );
+    }
+    let exe = std::env::current_exe()?;
+    // Rebuild the argv: `rrd lab <orig_args...>`.
+    let status = std::process::Command::new("unshare")
+        .args(["-rmn", "--propagation", "private"])
+        .arg(&exe)
+        .arg("lab")
+        .args(orig_args)
+        .env(INNER_ENV, "1")
+        .status()?;
+    std::process::exit(status.code().unwrap_or(1));
+}
+
+/// Options for a live run.
+pub struct LiveOptions {
+    pub topology: Topology,
+    /// Source node for the traffic-spread measurement (default first node).
+    pub from: Option<String>,
+    /// Destination node/host (default last node).
+    pub to: Option<String>,
+    /// Number of distinct source flows for the ECMP spread.
+    pub flows: usize,
+    /// Seconds to wait for convergence before measuring.
+    pub converge_secs: u64,
+    pub tick_ms: u64,
+    pub max_paths: u32,
+}
+
+/// Run a full live demo on the current (already-entered) namespace: realize,
+/// start all daemons, wait for convergence, print routes and a traffic report.
+pub async fn run_live(opts: LiveOptions) -> anyhow::Result<()> {
+    let topo = opts.topology;
+    topo.validate().map_err(|e| anyhow::anyhow!("{e}"))?;
+
+    let node_names: Vec<String> = topo.nodes.iter().map(|n| n.name.clone()).collect();
+    if node_names.is_empty() {
+        anyhow::bail!("topology has no nodes");
+    }
+    let from = opts.from.unwrap_or_else(|| node_names[0].clone());
+    let to = opts
+        .to
+        .unwrap_or_else(|| node_names[node_names.len() - 1].clone());
+
+    let log_dir = std::path::PathBuf::from(format!(
+        "/tmp/rrd_lab_live.{}",
+        nix::unistd::getuid().as_raw()
+    ));
+    let mut be = RootlessBackend::new(rrd_bin(), log_dir.clone(), opts.tick_ms, opts.max_paths);
+
+    println!("== realizing topology: {} nodes ==", node_names.len());
+    be.realize(&topo)
+        .await
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
+
+    println!("== starting {} rrd daemons ==", node_names.len());
+    for n in &node_names {
+        be.start_node(n).await.map_err(|e| anyhow::anyhow!("{e}"))?;
+    }
+
+    println!(
+        "== waiting {}s for the field to converge ==",
+        opts.converge_secs
+    );
+    tokio::time::sleep(Duration::from_secs(opts.converge_secs)).await;
+
+    // Show the source node's installed RING routes.
+    println!("\n-- {from}: installed RING routes (proto 155) --");
+    match be.routes(&from).await {
+        Ok(r) if !r.trim().is_empty() => println!("{}", r.trim()),
+        Ok(_) => println!("(no routes yet)"),
+        Err(e) => println!("(routes error: {e})"),
+    }
+
+    // Determine the transit relays to watch: every node that is neither source
+    // nor destination contributes its outgoing legs. For the report we list all
+    // (node, dev) veth endpoints on intermediate nodes.
+    let plan = crate::lab::netns::plan(&topo);
+    let relays: Vec<(String, String)> = plan
+        .nodes
+        .iter()
+        .filter(|n| n.name != from && n.name != to)
+        .flat_map(|n| n.ifaces.iter().map(move |d| (n.name.clone(), d.clone())))
+        .collect();
+
+    println!("\n== traffic: {from} -> {to}, {} flows ==", opts.flows);
+    let report = be
+        .traffic(&from, &to, opts.flows, &relays)
+        .await
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
+    println!(
+        "sent={} received={} ({:.0}% delivered)",
+        report.sent,
+        report.received,
+        if report.sent > 0 {
+            report.received as f64 / report.sent as f64 * 100.0
+        } else {
+            0.0
+        }
+    );
+    // Per-leg split, sorted descending so the spread is obvious.
+    let mut legs: Vec<(&String, &u64)> = report.per_leg.iter().collect();
+    legs.sort_by(|a, b| b.1.cmp(a.1));
+    println!("-- per-leg transit (packets forwarded during burst) --");
+    let max = legs.first().map(|(_, v)| **v).unwrap_or(0).max(1);
+    for (leg, n) in &legs {
+        let bar = "#".repeat(((**n as f64 / max as f64) * 40.0) as usize);
+        println!("  {:<18} {:>5}  {}", leg, n, bar);
+    }
+    let active = legs.iter().filter(|(_, v)| **v > 0).count();
+    println!(
+        "\n{} of {} transit legs carried traffic — load {}",
+        active,
+        legs.len(),
+        if active >= 2 {
+            "SPREAD across multiple paths"
+        } else {
+            "on a single path"
+        }
+    );
+
+    println!("\n== tearing down ==");
+    be.cleanup().await.map_err(|e| anyhow::anyhow!("{e}"))?;
+    Ok(())
+}
+
+/// Locate the daemon binary: `RRD_BIN` env, else this executable.
+fn rrd_bin() -> std::path::PathBuf {
+    std::env::var("RRD_BIN")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|_| std::env::current_exe().unwrap_or_else(|_| "rrd".into()))
+}
