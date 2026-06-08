@@ -260,6 +260,51 @@ impl FibReconciler {
     }
 }
 
+/// Build the `ip` argv for the abnormal-exit emergency flush, or `None` when there is
+/// nothing to flush (the graceful `withdraw_all` already emptied `installed`).
+///
+/// Factored out so the decision + argument vector are unit-testable without a live kernel.
+/// A single `ip -6 route flush proto <RING_PROTO>` removes every route this daemon owns
+/// (one daemon owns the netns's proto-155 routes), which is exactly `withdraw_all` done
+/// synchronously — the form a `Drop` can run during a panic unwind.
+fn emergency_flush_argv(installed_count: usize) -> Option<Vec<String>> {
+    if installed_count == 0 {
+        return None;
+    }
+    Some(vec![
+        "-6".to_string(),
+        "route".to_string(),
+        "flush".to_string(),
+        "proto".to_string(),
+        RING_PROTO.to_string(),
+    ])
+}
+
+impl Drop for FibReconciler {
+    /// Backstop for ABNORMAL exit (a panic in the run task, or any drop without a graceful
+    /// `withdraw_all`): synchronously flush our proto-155 routes so a crashed daemon does not
+    /// leave blackhole routes in the kernel until a manual flush (#21). On a clean shutdown
+    /// `withdraw_all` has already emptied `installed`, so this is a no-op. Best-effort: it
+    /// shells out to `ip` (ubiquitous on Linux) because rtnetlink offers no synchronous API
+    /// usable from `Drop`; failures are logged, never panic (a panic in `drop` during an
+    /// unwind would abort the process).
+    fn drop(&mut self) {
+        let Some(argv) = emergency_flush_argv(self.installed.len()) else {
+            return;
+        };
+        match std::process::Command::new("ip").args(&argv).status() {
+            Ok(s) if s.success() => {
+                tracing::warn!(
+                    "fib: emergency-flushed proto-{} routes on drop (abnormal exit)",
+                    RING_PROTO
+                );
+            }
+            Ok(s) => tracing::warn!("fib: emergency flush `ip {}` exited {}", argv.join(" "), s),
+            Err(e) => tracing::warn!("fib: emergency flush could not spawn `ip`: {}", e),
+        }
+    }
+}
+
 /// Whether a netlink delete error means the route is *already absent* — i.e.
 /// the desired state (route gone) is already satisfied and we should stop
 /// retrying.  The kernel returns `ESRCH` (3) or `ENOENT` (2) when asked to
@@ -278,6 +323,19 @@ fn is_already_gone(err: &rtnetlink::Error) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn emergency_flush_argv_is_none_when_nothing_installed() {
+        // Graceful shutdown empties `installed` before drop → the Drop backstop is a no-op.
+        assert!(emergency_flush_argv(0).is_none());
+    }
+
+    #[test]
+    fn emergency_flush_argv_flushes_ring_proto_when_routes_present() {
+        let argv = emergency_flush_argv(3).expect("a non-empty install yields a flush argv");
+        assert_eq!(argv, vec!["-6", "route", "flush", "proto", "155"]);
+        assert_eq!(argv[4], RING_PROTO.to_string(), "flushes exactly our proto tag");
+    }
 
     #[test]
     fn ecmp_weights_map_dominant_to_max_and_scale_proportionally() {
