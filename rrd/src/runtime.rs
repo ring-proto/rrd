@@ -459,6 +459,65 @@ mod tests {
         assert!(snap.routable.is_empty());
     }
 
+    fn intent(prefix_addr: &str, gateway: &str, oif: u32, weight: u8) -> RouteIntent {
+        RouteIntent {
+            prefix: Prefix {
+                addr: prefix_addr.parse().unwrap(),
+                len: 64,
+            },
+            nexthops: vec![NextHop {
+                gateway: gateway.parse().unwrap(),
+                oif,
+                weight,
+            }],
+        }
+    }
+
+    #[test]
+    fn canonicalize_intents_is_order_invariant() {
+        let a = intent("fd00:1::", "fe80::1", 1, 255);
+        let b = intent("fd00:2::", "fe80::1", 1, 255);
+
+        let mut forward = vec![a.clone(), b.clone()];
+        let mut reverse = vec![b, a];
+        canonicalize_intents(&mut forward);
+        canonicalize_intents(&mut reverse);
+
+        assert_eq!(forward, reverse);
+    }
+
+    #[test]
+    fn canonicalize_intents_detects_real_change() {
+        let base = vec![
+            intent("fd00:1::", "fe80::1", 1, 255),
+            intent("fd00:2::", "fe80::1", 1, 255),
+        ];
+        let mut base_canon = base.clone();
+        canonicalize_intents(&mut base_canon);
+
+        // (a) different gateway.
+        let mut diff_gateway = vec![
+            intent("fd00:1::", "fe80::1", 1, 255),
+            intent("fd00:2::", "fe80::9", 1, 255),
+        ];
+        canonicalize_intents(&mut diff_gateway);
+        assert_ne!(base_canon, diff_gateway);
+
+        // (b) different ecmp weight.
+        let mut diff_weight = vec![
+            intent("fd00:1::", "fe80::1", 1, 128),
+            intent("fd00:2::", "fe80::1", 1, 255),
+        ];
+        canonicalize_intents(&mut diff_weight);
+        assert_ne!(base_canon, diff_weight);
+
+        // (c) an extra intent.
+        let mut extra = base.clone();
+        extra.push(intent("fd00:3::", "fe80::1", 1, 255));
+        canonicalize_intents(&mut extra);
+        assert_ne!(base_canon, extra);
+    }
+
     #[tokio::test]
     async fn metrics_count_datagrams_and_decode_errors() {
         use crate::transport::Inbound;
