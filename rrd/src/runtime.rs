@@ -24,12 +24,6 @@ use std::time::Instant;
 use tokio::sync::{mpsc, watch};
 use tokio::time;
 
-/// A base offset added to every `now()` so the first engine age is harmless.
-/// Value: 1000 ticks worth of time (matching the ring-sim convention).
-fn base_offset(tick: Mono) -> Mono {
-    tick * 1000
-}
-
 /// Sort route intents into a canonical order (by destination prefix) so the
 /// reconcile dirty-check is invariant to the engine's internal slot ordering
 /// (which shifts when reach-ball GC compacts). Intra-intent next-hop order is
@@ -164,9 +158,12 @@ impl<T: Transport> Daemon<T> {
         (daemon, rib_rx, local_origin_tx)
     }
 
-    /// Current monotonic time fed to the engine.
+    /// Current monotonic time fed to the engine: elapsed since the daemon started. Anchored at
+    /// ~0 so the engine's first `step`/`ingest` (with `last_aged` at `Mono::ZERO`) ages by ~0
+    /// ticks rather than a spurious offset — all aging is relative (`ticks_between`), so the
+    /// absolute zero point is immaterial except for that first call (#25).
     fn now(&self) -> Mono {
-        base_offset(self.cfg.cfg.tick) + self.start.elapsed()
+        self.start.elapsed()
     }
 
     /// Resolve or allocate a NeighborId for `(iface, src_ip)`.

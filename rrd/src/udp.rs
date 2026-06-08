@@ -41,6 +41,17 @@ pub struct Udp6Transport {
     sockets: Vec<(u32, UdpSocket)>,
     /// Receives (ifindex, src, data) tuples produced by per-socket reader tasks.
     rx: mpsc::Receiver<Inbound>,
+    /// Handles to the per-socket reader tasks, aborted when the transport is dropped so a
+    /// retired/reconfigured transport does not leave parked readers holding fds + buffers (#34).
+    readers: Vec<tokio::task::JoinHandle<()>>,
+}
+
+impl Drop for Udp6Transport {
+    fn drop(&mut self) {
+        for h in &self.readers {
+            h.abort();
+        }
+    }
 }
 
 impl Udp6Transport {
@@ -50,6 +61,7 @@ impl Udp6Transport {
         let (tx, rx) = mpsc::channel::<Inbound>(256);
 
         let mut sockets = Vec::with_capacity(ifaces.len());
+        let mut readers = Vec::with_capacity(ifaces.len());
 
         for &ifindex in ifaces {
             let sock = make_socket(ifindex)?;
@@ -61,12 +73,16 @@ impl Udp6Transport {
             sockets.push((ifindex, sock));
 
             // Spawn a task that reads from this interface socket and forwards to
-            // the shared receiver channel.
+            // the shared receiver channel. Retain the handle so Drop can abort it.
             let tx_clone = tx.clone();
-            tokio::spawn(reader_task(reader_sock, ifindex, tx_clone));
+            readers.push(tokio::spawn(reader_task(reader_sock, ifindex, tx_clone)));
         }
 
-        Ok(Udp6Transport { sockets, rx })
+        Ok(Udp6Transport {
+            sockets,
+            rx,
+            readers,
+        })
     }
 }
 
@@ -190,6 +206,23 @@ async fn reader_task(sock: UdpSocket, ifindex: u32, tx: mpsc::Sender<Inbound>) {
             std::net::SocketAddr::V6(v6) => v6,
             std::net::SocketAddr::V4(_) => continue,
         };
+
+        // Defensive scope-id cross-check (#35). The runtime keys neighbours by `(ifindex, src_ip)`
+        // and drops the source's scope id, trusting SO_BINDTODEVICE to constrain RX to `ifindex`.
+        // For a link-local (`fe80::`) source the kernel stamps the receiving ifindex as the scope
+        // id, so it should equal `ifindex`; a mismatch means the binding assumption is violated
+        // (e.g. wildcard delivery in a SO_REUSEPORT group) and the static ifindex tag would be
+        // wrong — surface it rather than silently mis-resolve the neighbour's output interface.
+        let scope = src.scope_id();
+        if scope != 0 && scope != ifindex {
+            tracing::warn!(
+                iface = ifindex,
+                scope_id = scope,
+                src = %src.ip(),
+                "Udp6Transport reader[iface={}]: src scope id {} != bound ifindex (SO_BINDTODEVICE assumption violated)",
+                ifindex, scope,
+            );
+        }
 
         // Truncation guard: a datagram that exactly fills the buffer may have been
         // cut short by the kernel (the tail is lost, so decode will reject the frame).
