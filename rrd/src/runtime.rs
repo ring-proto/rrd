@@ -16,7 +16,7 @@ use crate::config::DaemonConfig;
 use crate::fib::{ecmp_weights, FibReconciler, NextHop, RouteIntent};
 use crate::transport::{Inbound, Transport};
 use crate::wire;
-use ring_core::{Engine, Mono, NeighborId, Prefix, RouterId};
+use ring_core::{DesiredRoute, Engine, Mono, NeighborId, Prefix, RouterId};
 use std::collections::HashMap;
 use std::future::Future;
 use std::net::Ipv6Addr;
@@ -28,6 +28,14 @@ use tokio::time;
 /// Value: 1000 ticks worth of time (matching the ring-sim convention).
 fn base_offset(tick: Mono) -> Mono {
     tick * 1000
+}
+
+/// Sort route intents into a canonical order (by destination prefix) so the
+/// reconcile dirty-check is invariant to the engine's internal slot ordering
+/// (which shifts when reach-ball GC compacts). Intra-intent next-hop order is
+/// already deterministic (descending current-split weight from `desired_routes`).
+fn canonicalize_intents(intents: &mut [RouteIntent]) {
+    intents.sort_by_key(|i| (i.prefix.addr, i.prefix.len));
 }
 
 /// Operational metrics, published alongside the RIB each tick. Gauges are the
@@ -102,6 +110,9 @@ pub struct Daemon<T: Transport> {
     fib_errors: u64,
     /// Cumulative neighbours reclaimed by the engine's prune pass.
     neighbors_pruned: u64,
+    /// Last canonicalised intent set handed to `fib.reconcile`, used as the
+    /// dirty-check so a steady-state tick skips the netlink round-trip (#13).
+    last_intents: Vec<RouteIntent>,
 }
 
 impl<T: Transport> Daemon<T> {
@@ -148,6 +159,7 @@ impl<T: Transport> Daemon<T> {
             fib_ops: 0,
             fib_errors: 0,
             neighbors_pruned: 0,
+            last_intents: Vec::new(),
         };
         (daemon, rib_rx, local_origin_tx)
     }
@@ -211,10 +223,9 @@ impl<T: Transport> Daemon<T> {
     /// a multipath route, so the field's load split reaches the dataplane.
     /// Hops whose locator is unknown are skipped; a route with no resolvable
     /// hops is dropped entirely.
-    fn build_route_intents(&self) -> Vec<RouteIntent> {
-        let now = self.now();
+    fn build_route_intents_from(&self, desired: &[DesiredRoute]) -> Vec<RouteIntent> {
         let mut intents = Vec::new();
-        for dr in self.engine.desired_routes(now) {
+        for dr in desired {
             if !dr.routable {
                 continue;
             }
@@ -271,11 +282,21 @@ impl<T: Transport> Daemon<T> {
     }
 
     /// Build a RIB snapshot from the engine's current desired_routes.
+    ///
+    /// Thin wrapper that materialises `desired_routes` once and delegates to
+    /// [`Self::build_snapshot_from`]; kept for tests that want a snapshot
+    /// without a pre-computed slice. The tick loop calls `build_snapshot_from`
+    /// directly with the `desired` it already has.
+    #[cfg(test)]
     fn build_snapshot(&self) -> RibSnapshot {
-        let now = self.now();
-        let routable: Vec<(RouterId, Prefix)> = self
-            .engine
-            .desired_routes(now)
+        let desired: Vec<DesiredRoute> = self.engine.desired_routes(self.now()).collect();
+        self.build_snapshot_from(&desired)
+    }
+
+    /// Build a RIB snapshot from a pre-computed `desired_routes` slice.
+    fn build_snapshot_from(&self, desired: &[DesiredRoute]) -> RibSnapshot {
+        let routable: Vec<(RouterId, Prefix)> = desired
+            .iter()
             .filter(|r| r.routable)
             .filter_map(|r| {
                 self.prefix_to_rid
@@ -351,23 +372,40 @@ impl<T: Transport> Daemon<T> {
                         tracing::debug!(?nid, "neighbour pruned (silent past link-aging horizon)");
                     }
                     self.neighbors_pruned += out.pruned.len() as u64;
-                    // FIB reconcile after each tick. Build the intents first (an
-                    // immutable borrow of `self`), then take the `&mut self.fib`
-                    // borrow only inside the block so it ends before we update the
-                    // cumulative counters on `self`.
+
+                    // Compute the engine's desired routes ONCE this tick and derive
+                    // both the FIB intents and the RIB snapshot from it (#13: no
+                    // double iteration of the destination table).
+                    let desired: Vec<DesiredRoute> = self.engine.desired_routes(now).collect();
+
+                    // FIB reconcile ONLY when the canonical intent set changed since
+                    // the last reconcile (#13). In steady state this is a cheap Vec
+                    // comparison with no netlink round-trip and no `.await`, so an
+                    // unchanged route set never yields the select! loop on the FIB
+                    // path (mitigating the inline-await stall, #14).
                     if self.fib.is_some() {
-                        let intents = self.build_route_intents();
-                        let mut stats = crate::fib::ReconcileStats::default();
-                        if let Some(fib) = &mut self.fib {
-                            stats = fib.reconcile(&intents).await;
+                        let mut intents = self.build_route_intents_from(&desired);
+                        canonicalize_intents(&mut intents);
+                        if intents != self.last_intents {
+                            // `build_route_intents_from` (an immutable borrow of
+                            // `self`) has returned an owned Vec, so taking the
+                            // `&mut self.fib` borrow only now is sound; it ends
+                            // before the cumulative-counter updates below.
+                            let stats = if let Some(fib) = self.fib.as_mut() {
+                                fib.reconcile(&intents).await
+                            } else {
+                                crate::fib::ReconcileStats::default()
+                            };
+                            self.fib_ops += stats.ops as u64;
+                            self.fib_errors += stats.errors as u64;
+                            self.last_intents = intents;
                         }
-                        self.fib_ops += stats.ops as u64;
-                        self.fib_errors += stats.errors as u64;
                     }
-                    // Build the snapshot once (after reconcile, so `routes` reflects
-                    // this tick's installs) and reuse it for both the watch publish
+
+                    // Build the snapshot from the same `desired` (after any reconcile,
+                    // so `routes` reflects this tick's installs) for the watch publish
                     // and the periodic status log.
-                    let snap = self.build_snapshot();
+                    let snap = self.build_snapshot_from(&desired);
                     let _ = self.rib_tx.send(snap.clone());
 
                     let elapsed = self.start.elapsed();
