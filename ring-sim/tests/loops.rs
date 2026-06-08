@@ -7,11 +7,11 @@ fn has_persistent_loop(fab: &Fabric, dst: usize) -> bool {
     let n = fab.n();
     // build via edges: node -> via-node (if routable and has a via)
     let mut via = vec![usize::MAX; n];
-    for s in 0..n {
+    for (s, slot) in via.iter_mut().enumerate() {
         if s == dst { continue; }
         if let Some(r) = fab.route(s, dst) {
             if let Some(ring_core::NeighborId(j)) = r.via {
-                if r.routable { via[s] = j as usize; }
+                if r.routable { *slot = j as usize; }
             }
         }
     }

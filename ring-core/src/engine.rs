@@ -675,8 +675,10 @@ mod tests {
 
     #[test]
     fn no_retard_adopts_vitality_unaged() {
-        let mut cfg = Config::default();
-        cfg.no_retard = true;
+        let cfg = Config {
+            no_retard: true,
+            ..Default::default()
+        };
         let mut a = Engine::new(RouterId::from("a"), px(1), cfg, Default::default());
         a.add_neighbor(NeighborId(1));
         let msg = Message {
@@ -917,8 +919,10 @@ mod tests {
 
     #[test]
     fn dest_budget_refuses_new_untrusted_dests_but_refreshes_known() {
-        let mut cfg = Config::default();
-        cfg.max_dests = 2; // origin "a" + exactly one learned remote
+        let cfg = Config {
+            max_dests: 2, // origin "a" + exactly one learned remote
+            ..Default::default()
+        };
         let mut a = Engine::new(RouterId::from("a"), px(1), cfg, Default::default());
         a.add_neighbor(NeighborId(1));
 
@@ -963,8 +967,10 @@ mod tests {
 
     #[test]
     fn gc_never_evicts_a_local_origin_after_long_silence() {
-        let mut cfg = Config::default();
-        cfg.gc_dwell = 8.0;
+        let cfg = Config {
+            gc_dwell: 8.0,
+            ..Default::default()
+        };
         let mut a = Engine::new(RouterId::from("a"), px(1), cfg, Default::default());
         a.add_local_origin(RouterId::from("pod:x"), px(77));
         assert_eq!(a.dest_count(), 2, "primary origin + dynamic origin");
@@ -993,9 +999,11 @@ mod tests {
     fn gc_keeps_far_but_alive_dest_with_low_f() {
         // A dest that is ALIVE (vit ≥ φ) but has tiny f (< floor) must NOT be evicted:
         // liveness protects far destinations whose potential hasn't built up locally.
-        let mut cfg = Config::default();
-        cfg.gc_dwell = 4.0;
-        cfg.no_link_age = true; // keep the link hot so we keep hearing the neighbour
+        let cfg = Config {
+            gc_dwell: 4.0,
+            no_link_age: true, // keep the link hot so we keep hearing the neighbour
+            ..Default::default()
+        };
         let mut a = Engine::new(RouterId::from("a"), px(1), cfg, Default::default());
         a.add_neighbor(NeighborId(1));
 
@@ -1032,9 +1040,11 @@ mod tests {
         // CRITICAL: with three learned dests b,c,d (slots 1,2,3), evict the MIDDLE one (c) and
         // assert b and d are untouched — same f, vit, via, prefix — and dest_slot resolves them
         // to the correct (remapped) slots, proving no cross-contamination from the index remap.
-        let mut cfg = Config::default();
-        cfg.gc_dwell = 6.0;
-        cfg.no_link_age = true; // keep the link hot so b,d keep being heard at fixed point
+        let cfg = Config {
+            gc_dwell: 6.0,
+            no_link_age: true, // keep the link hot so b,d keep being heard at fixed point
+            ..Default::default()
+        };
         let mut a = Engine::new(RouterId::from("a"), px(1), cfg, Default::default());
         a.add_neighbor(NeighborId(1));
 
@@ -1426,9 +1436,11 @@ mod tests {
 
     #[test]
     fn charge_glides_toward_target_without_overshoot() {
-        let mut cfg = Config::default();
-        cfg.crowd = 1.0;
-        cfg.glide = 1.0;
+        let cfg = Config {
+            crowd: 1.0,
+            glide: 1.0,
+            ..Default::default()
+        };
         let mut a = Engine::new(RouterId::from("a"), px(1), cfg, Default::default());
         a.set_stress(3.0); // target = crowd·stress = 3.0
         let mut prev = a.charge();

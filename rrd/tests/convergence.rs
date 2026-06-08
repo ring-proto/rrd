@@ -13,8 +13,10 @@ use std::time::Duration;
 use tokio::sync::watch;
 
 fn make_config(id: &str, prefix_addr: Ipv6Addr, tick_ms: u64) -> DaemonConfig {
-    let mut cfg = Config::default();
-    cfg.tick = Duration::from_millis(tick_ms);
+    let cfg = Config {
+        tick: Duration::from_millis(tick_ms),
+        ..Default::default()
+    };
     DaemonConfig {
         router_id: RouterId(id.to_string()),
         prefix: Prefix {

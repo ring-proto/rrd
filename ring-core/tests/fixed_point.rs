@@ -85,8 +85,7 @@ impl SyncMesh {
             // 1. snapshot every engine's emission
             let emits: Vec<Message> = self.engines.iter_mut().map(|e| e.step(now).emit).collect();
             // 2. deliver each emission to that node's neighbours
-            for src in 0..self.engines.len() {
-                let msg = &emits[src];
+            for (src, msg) in emits.iter().enumerate() {
                 for &(nbr, _) in &self.wiring[src] {
                     // find the NeighborId `nbr` uses to refer to `src`
                     let nid = self.wiring[nbr].iter().find(|&&(t, _)| t == src).unwrap().1;
@@ -99,9 +98,11 @@ impl SyncMesh {
 
 #[test]
 fn engine_field_matches_centralized_solver_on_a_line() {
-    let mut cfg = Config::default();
-    // Exact static M-matrix oracle: raw conductances, no staleness sawtooth.
-    cfg.no_link_age = true;
+    let cfg = Config {
+        // Exact static M-matrix oracle: raw conductances, no staleness sawtooth.
+        no_link_age: true,
+        ..Default::default()
+    };
     // 5-node line: 0-1-2-3-4, unit conductance. Destination = node 0.
     let edges = [(0, 1, 1.0), (1, 2, 1.0), (2, 3, 1.0), (3, 4, 1.0)];
     let n = 5;
@@ -113,24 +114,26 @@ fn engine_field_matches_centralized_solver_on_a_line() {
     mesh.run(2000, &cfg); // ample for degree-≤2 contraction to converge
 
     let dst_id = RouterId::from(format!("n{dst}").as_str());
-    for i in 0..n {
+    for (i, &truth_i) in truth.iter().enumerate() {
         if i == dst {
             continue;
         }
         let f = mesh.engines[i].peek_pot(&dst_id).unwrap();
         assert!(
-            (f - truth[i]).abs() < 1e-3,
+            (f - truth_i).abs() < 1e-3,
             "node {i}: engine f={f} vs solver f*={}",
-            truth[i]
+            truth_i
         );
     }
 }
 
 #[test]
 fn engine_field_matches_centralized_solver_on_a_mesh() {
-    let mut cfg = Config::default();
-    // Exact static M-matrix oracle: raw conductances, no staleness sawtooth.
-    cfg.no_link_age = true;
+    let cfg = Config {
+        // Exact static M-matrix oracle: raw conductances, no staleness sawtooth.
+        no_link_age: true,
+        ..Default::default()
+    };
     // A small irregular mesh with a mixed-conductance edge.
     let edges = [
         (0, 1, 1.0),
@@ -148,15 +151,15 @@ fn engine_field_matches_centralized_solver_on_a_mesh() {
     mesh.run(3000, &cfg);
 
     let dst_id = RouterId::from(format!("n{dst}").as_str());
-    for i in 0..n {
+    for (i, &truth_i) in truth.iter().enumerate() {
         if i == dst {
             continue;
         }
         let f = mesh.engines[i].peek_pot(&dst_id).unwrap();
         assert!(
-            (f - truth[i]).abs() < 1e-3,
+            (f - truth_i).abs() < 1e-3,
             "node {i}: engine f={f} vs solver f*={}",
-            truth[i]
+            truth_i
         );
     }
 }

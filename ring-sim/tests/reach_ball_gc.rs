@@ -11,10 +11,11 @@ use ring_sim::{Fabric, LinkSpec};
 /// peer's conductance ages out (`f` only drains as fast as the link conductance ages, which is far
 /// slower than vitality), so the drained+dead window opens without simulating ~10^6 ticks.
 fn gc_cfg() -> Config {
-    let mut cfg = Config::default();
-    cfg.gc_dwell = 8.0;
-    cfg.floor = 0.05;
-    cfg
+    Config {
+        gc_dwell: 8.0,
+        floor: 0.05,
+        ..Default::default()
+    }
 }
 
 #[test]

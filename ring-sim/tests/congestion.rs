@@ -5,9 +5,11 @@ use ring_sim::{Fabric, LinkSpec};
 fn stressing_the_short_path_diverts_traffic() {
     // Diamond: S=0. Short path S-A-D (0-1-4). Long path S-B1-B2-D (0-2-3-4).
     // Unstressed, S routes to D via the shorter/higher-potential A(=1). Stress A -> divert to B1(=2).
-    let mut cfg = Config::default();
-    cfg.crowd = 2.0; // congestion ON (keep below the conservative 1/||Ds|| basin; tune if unstable)
-    cfg.glide = 1.0;
+    let cfg = Config {
+        crowd: 2.0, // congestion ON (keep below the conservative 1/||Ds|| basin; tune if unstable)
+        glide: 1.0,
+        ..Default::default()
+    };
     let links = [
         LinkSpec::clean(0, 1), // S-A
         LinkSpec::clean(1, 4), // A-D
