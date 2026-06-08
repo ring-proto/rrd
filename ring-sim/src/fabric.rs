@@ -176,6 +176,13 @@ impl Fabric {
     pub fn router_id(&self, i: usize) -> RouterId {
         self.nodes[i].id.clone()
     }
+
+    /// The number of destination slots currently interned by node `i`'s engine (origins +
+    /// learned remotes). Used by reach-ball-GC tests to observe eviction (the count shrinks
+    /// when a drained, dead, non-origin dest is reaped).
+    pub fn dest_count(&self, i: usize) -> usize {
+        self.nodes[i].engine.dest_count()
+    }
 }
 
 impl Fabric {
