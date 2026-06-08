@@ -76,6 +76,14 @@ pub struct Cli {
     #[arg(long)]
     pub phi: Option<f64>,
 
+    /// Maximum number of destinations the engine will intern (untrusted-intern DoS bound).
+    #[arg(long, default_value_t = 65536)]
+    pub max_dests: usize,
+
+    /// Ticks a drained, dead, non-origin destination must dwell before reach-ball GC evicts it.
+    #[arg(long, default_value_t = 32.0)]
+    pub gc_dwell: f64,
+
     /// Disable kernel FIB installation (control-plane only).
     #[arg(long, default_value_t = false)]
     pub no_fib: bool,
@@ -118,6 +126,8 @@ impl DaemonConfig {
 
         let mut cfg = Config {
             tick: Duration::from_millis(cli.tick_ms),
+            max_dests: cli.max_dests,
+            gc_dwell: cli.gc_dwell,
             ..Config::default()
         };
         if let Some(k) = cli.kappa {
@@ -209,6 +219,28 @@ mod tests {
         assert_eq!(cli.prefix, "fd00:0:1::/64");
         assert_eq!(cli.ifaces, vec!["lo"]);
         assert_eq!(cli.control_socket.as_deref(), Some("/tmp/rrd.sock"));
+        // dest-budget / GC flags default when unset.
+        assert_eq!(cli.max_dests, 65536);
+        assert_eq!(cli.gc_dwell, 32.0);
+    }
+
+    #[test]
+    fn cli_parses_dest_budget_and_gc_dwell_flags() {
+        let args = vec![
+            "rrd",
+            "--prefix",
+            "fd00:0:1::/64",
+            "--max-dests",
+            "1024",
+            "--gc-dwell",
+            "12.5",
+        ];
+        let cli = Cli::try_parse_from(args).expect("should parse");
+        assert_eq!(cli.max_dests, 1024);
+        assert_eq!(cli.gc_dwell, 12.5);
+        let dc = DaemonConfig::from_cli(&cli).expect("should build");
+        assert_eq!(dc.cfg.max_dests, 1024);
+        assert_eq!(dc.cfg.gc_dwell, 12.5);
     }
 
     #[test]
@@ -221,6 +253,8 @@ mod tests {
             kappa: Some(0.2),
             alpha: None,
             phi: None,
+            max_dests: 65536,
+            gc_dwell: 32.0,
             no_fib: false,
             max_paths: 4,
             control_socket: None,
@@ -230,6 +264,8 @@ mod tests {
         assert_eq!(dc.cfg.tick, Duration::from_millis(200));
         assert!((dc.cfg.kappa - 0.2).abs() < 1e-12);
         assert_eq!(dc.policy.max_paths, 4);
+        assert_eq!(dc.cfg.max_dests, 65536);
+        assert_eq!(dc.cfg.gc_dwell, 32.0);
     }
 
     #[test]
@@ -242,6 +278,8 @@ mod tests {
             kappa: None,
             alpha: None,
             phi: None,
+            max_dests: 65536,
+            gc_dwell: 32.0,
             no_fib: true,
             max_paths: 0,
             control_socket: None,

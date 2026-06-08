@@ -44,10 +44,6 @@ pub enum LocalOriginCommand {
     Remove { dest: RouterId },
 }
 
-/// Maximum number of distinct destinations the engine will intern from untrusted wire input.
-/// This bounds `intern_dest` growth from adversarial advertisements.
-const MAX_DESTS: usize = 4096;
-
 /// The engine-driver daemon.  Generic over the transport so tests can use `MemTransport`.
 pub struct Daemon<T: Transport> {
     engine: Engine,
@@ -147,17 +143,9 @@ impl<T: Transport> Daemon<T> {
                         .or_insert_with(|| entry.dest.clone());
                 }
 
-                // CAP: guard against dest table explosion from untrusted input.
-                let dest_count = self.prefix_to_rid.len();
-                if dest_count >= MAX_DESTS {
-                    tracing::debug!(
-                        "dest table at {} entries, dropping inbound delta from {:?}",
-                        dest_count,
-                        msg.from
-                    );
-                    return;
-                }
-
+                // The engine enforces the untrusted-intern budget per-entry (Config::max_dests):
+                // over-budget destinations are silently skipped, and reach-ball GC reaps drained,
+                // dead, non-origin slots. No daemon-side cap is needed here.
                 let now = self.now();
                 self.engine.ingest(now, nid, &msg);
             }
