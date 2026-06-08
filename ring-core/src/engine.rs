@@ -345,6 +345,27 @@ impl Engine {
         }
         self.load = carried;
 
+        // Reach-ball GC. A slot is GC-eligible iff it is NOT an origin, has drained below the
+        // floor (f < floor, unreachable), AND has decayed below φ (vit < φ, dead). vit was aged
+        // to `now` by age_all at step start. Refresh gc_ok_at for every slot that is NOT eligible
+        // (origin, still reachable, or still live), so the dwell clock only runs while a slot is
+        // continuously drained+dead. This protects far-but-alive dests: a live dest has vit ≥ φ.
+        for d in 0..ndest {
+            let origin = self.local_origins.contains_key(&self.dest_key[d]);
+            if origin || self.f[d] >= self.cfg.floor || self.vit[d] >= self.cfg.phi {
+                self.gc_ok_at[d] = now;
+            }
+        }
+        let evict: Vec<usize> = (0..ndest)
+            .filter(|&d| {
+                !self.local_origins.contains_key(&self.dest_key[d])
+                    && ticks_between(self.gc_ok_at[d], now, self.cfg.tick) >= self.cfg.gc_dwell
+            })
+            .collect();
+        if !evict.is_empty() {
+            self.compact(&evict);
+        }
+
         StepOutput {
             emit: Message {
                 from: self.id.clone(),
@@ -352,6 +373,35 @@ impl Engine {
                 delta,
             },
         }
+    }
+
+    /// Drop the slots in `evict` (eviction by reach-ball GC), compacting every dense parallel
+    /// structure by gathering the kept slots in their original order and rebuilding `dest_slot`
+    /// from the new `dest_key`. The remap preserves all surviving slots' state exactly (no
+    /// cross-contamination): each `self.X = keep.iter().map(|&o| self.X[o]).collect()` fully
+    /// builds the new Vec from the immutable read before the move-assignment. There is no
+    /// `self_slot` to fix — origins live in `local_origins`, keyed by RouterId.
+    fn compact(&mut self, evict: &[usize]) {
+        let keep: Vec<usize> = (0..self.dest_key.len())
+            .filter(|d| !evict.contains(d))
+            .collect();
+        self.f = keep.iter().map(|&o| self.f[o]).collect();
+        self.vit = keep.iter().map(|&o| self.vit[o]).collect();
+        self.dominant = keep.iter().map(|&o| self.dominant[o]).collect();
+        self.gc_ok_at = keep.iter().map(|&o| self.gc_ok_at[o]).collect();
+        self.dest_prefix = keep.iter().map(|&o| self.dest_prefix[o]).collect();
+        self.hops = keep.iter().map(|&o| self.hops[o].clone()).collect();
+        self.dest_key = keep.iter().map(|&o| self.dest_key[o].clone()).collect();
+        for p in self.neighbors.values_mut() {
+            p.pot = keep.iter().map(|&o| p.pot[o]).collect();
+        }
+        self.fbuf.resize(keep.len(), 0.0); // scratch; rewritten each step
+        self.dest_slot = self
+            .dest_key
+            .iter()
+            .enumerate()
+            .map(|(i, k)| (k.clone(), i))
+            .collect();
     }
 
     /// The FIB reconciler's view: one `DesiredRoute` per KNOWN, non-self destination, with the
@@ -812,6 +862,173 @@ mod tests {
         a.ingest(Duration::ZERO, NeighborId(1), &refresh);
         assert_eq!(a.dest_count(), 2, "refresh of known dest does not grow");
         assert!(a.route(Duration::ZERO, &RouterId::from("b")).is_some());
+    }
+
+    #[test]
+    fn gc_never_evicts_a_local_origin_after_long_silence() {
+        let mut cfg = Config::default();
+        cfg.gc_dwell = 8.0;
+        let mut a = Engine::new(RouterId::from("a"), px(1), cfg, Default::default());
+        a.add_local_origin(RouterId::from("pod:x"), px(77));
+        assert_eq!(a.dest_count(), 2, "primary origin + dynamic origin");
+
+        // Step far past gc_dwell with NO ingest: origins have f=0 (pinned) and vit stays 0,
+        // so they are GC-eligible by f/vit — but the origin guard must protect them.
+        for k in 0..200u32 {
+            a.step(cfg.tick * k);
+        }
+        assert_eq!(
+            a.dest_count(),
+            2,
+            "origins are never GC-evicted even after long silence"
+        );
+        // And both are still emitted as self-pins.
+        let out = a.step(cfg.tick * 200);
+        assert!(out.emit.delta.iter().any(|e| e.dest == RouterId::from("a")));
+        assert!(out
+            .emit
+            .delta
+            .iter()
+            .any(|e| e.dest == RouterId::from("pod:x")));
+    }
+
+    #[test]
+    fn gc_keeps_far_but_alive_dest_with_low_f() {
+        // A dest that is ALIVE (vit ≥ φ) but has tiny f (< floor) must NOT be evicted:
+        // liveness protects far destinations whose potential hasn't built up locally.
+        let mut cfg = Config::default();
+        cfg.gc_dwell = 4.0;
+        cfg.no_link_age = true; // keep the link hot so we keep hearing the neighbour
+        let mut a = Engine::new(RouterId::from("a"), px(1), cfg, Default::default());
+        a.add_neighbor(NeighborId(1));
+
+        // Neighbour keeps d ALIVE (vit=1 each round) but advertises a TINY potential, so a's
+        // own f toward d settles below the floor. We refresh every step so vit stays ≥ φ.
+        let mk = Message {
+            from: RouterId::from("n1"),
+            hears: vec![RouterId::from("a")],
+            delta: vec![Entry {
+                dest: RouterId::from("d"),
+                prefix: px(9),
+                pot: 1e-9, // below floor after screening
+                vit: 1.0,
+            }],
+        };
+        for k in 0..50u32 {
+            let now = cfg.tick * k;
+            a.ingest(now, NeighborId(1), &mk);
+            a.step(now);
+        }
+        assert!(
+            a.peek_pot(&RouterId::from("d")).unwrap() < cfg.floor,
+            "f stays below floor (far)"
+        );
+        assert!(
+            a.peek_vit(&RouterId::from("d")).unwrap() >= cfg.phi,
+            "but vit stays ≥ φ (alive)"
+        );
+        assert_eq!(a.dest_count(), 2, "alive dest survives GC despite low f");
+    }
+
+    #[test]
+    fn gc_compaction_preserves_surviving_slots_when_middle_evicted() {
+        // CRITICAL: with three learned dests b,c,d (slots 1,2,3), evict the MIDDLE one (c) and
+        // assert b and d are untouched — same f, vit, via, prefix — and dest_slot resolves them
+        // to the correct (remapped) slots, proving no cross-contamination from the index remap.
+        let mut cfg = Config::default();
+        cfg.gc_dwell = 6.0;
+        cfg.no_link_age = true; // keep the link hot so b,d keep being heard at fixed point
+        let mut a = Engine::new(RouterId::from("a"), px(1), cfg, Default::default());
+        a.add_neighbor(NeighborId(1));
+
+        // Distinct potentials & prefixes so any slot mix-up is detectable.
+        let alive = Message {
+            from: RouterId::from("n1"),
+            hears: vec![RouterId::from("a")],
+            delta: vec![
+                Entry { dest: RouterId::from("b"), prefix: px(11), pot: 0.90, vit: 1.0 },
+                Entry { dest: RouterId::from("c"), prefix: px(22), pot: 0.50, vit: 1.0 },
+                Entry { dest: RouterId::from("d"), prefix: px(33), pot: 0.70, vit: 1.0 },
+            ],
+        };
+        // Drive all three to a fixed point.
+        for k in 0..40u32 {
+            let now = cfg.tick * k;
+            a.ingest(now, NeighborId(1), &alive);
+            a.step(now);
+        }
+        assert_eq!(a.dest_count(), 4, "origin a + b + c + d");
+        // c sits in the MIDDLE slot.
+        assert!(a.peek_pot(&RouterId::from("c")).is_some());
+
+        // Snapshot b and d at the fixed point (before eviction).
+        let now0 = cfg.tick * 40;
+        let b_pot = a.peek_pot(&RouterId::from("b")).unwrap();
+        let d_pot = a.peek_pot(&RouterId::from("d")).unwrap();
+        let b_via = a.route(now0, &RouterId::from("b")).unwrap().via;
+        let d_via = a.route(now0, &RouterId::from("d")).unwrap().via;
+
+        // Phase 1 — the SOURCE of c withdraws: it advertises c with a drained potential (pot=0 →
+        // a's neighbour-pot toward c, and thus a's f, fall to 0) and a dead vit (vit=0 → the
+        // adopt-max never re-raises c's decaying vitality). b and d stay at their fixed point.
+        let drain_c = Message {
+            from: RouterId::from("n1"),
+            hears: vec![RouterId::from("a")],
+            delta: vec![
+                Entry { dest: RouterId::from("b"), prefix: px(11), pot: 0.90, vit: 1.0 },
+                Entry { dest: RouterId::from("c"), prefix: px(22), pot: 0.0, vit: 0.0 },
+                Entry { dest: RouterId::from("d"), prefix: px(33), pot: 0.70, vit: 1.0 },
+            ],
+        };
+        for k in 40..70u32 {
+            let now = cfg.tick * k;
+            a.ingest(now, NeighborId(1), &drain_c);
+            a.step(now);
+        }
+        // Phase 2 — c falls out of the advertisement entirely (its neighbour-pot already 0). b and
+        // d stay alive. c is now continuously GC-eligible and is evicted after gc_dwell ticks,
+        // without being re-interned (the source no longer mentions it).
+        let alive_bd = Message {
+            from: RouterId::from("n1"),
+            hears: vec![RouterId::from("a")],
+            delta: vec![
+                Entry { dest: RouterId::from("b"), prefix: px(11), pot: 0.90, vit: 1.0 },
+                Entry { dest: RouterId::from("d"), prefix: px(33), pot: 0.70, vit: 1.0 },
+            ],
+        };
+        for k in 70..200u32 {
+            let now = cfg.tick * k;
+            a.ingest(now, NeighborId(1), &alive_bd);
+            a.step(now);
+        }
+
+        // c is gone; b and d remain.
+        assert_eq!(a.dest_count(), 3, "origin a + b + d (c evicted)");
+        assert!(
+            a.route(cfg.tick * 200, &RouterId::from("c")).is_none(),
+            "evicted dest c is no longer interned"
+        );
+
+        // b and d unchanged (at fixed point) — proves no cross-contamination from the remap.
+        let now1 = cfg.tick * 200;
+        assert!(
+            (a.peek_pot(&RouterId::from("b")).unwrap() - b_pot).abs() < 1e-9,
+            "b's f unchanged across compaction"
+        );
+        assert!(
+            (a.peek_pot(&RouterId::from("d")).unwrap() - d_pot).abs() < 1e-9,
+            "d's f unchanged across compaction"
+        );
+        assert_eq!(a.route(now1, &RouterId::from("b")).unwrap().via, b_via);
+        assert_eq!(a.route(now1, &RouterId::from("d")).unwrap().via, d_via);
+        // Prefixes still resolve to the RIGHT dest (no slot bleed from the evicted middle).
+        let routes: Vec<_> = a.desired_routes(now1).collect();
+        assert!(routes.iter().any(|r| r.prefix == px(11)), "b prefix present");
+        assert!(routes.iter().any(|r| r.prefix == px(33)), "d prefix present");
+        assert!(
+            routes.iter().all(|r| r.prefix != px(22)),
+            "evicted c's prefix must be gone"
+        );
     }
 
     #[test]
