@@ -141,10 +141,18 @@ fn rejoin_group(sock: &UdpSocket, ifindex: u32) {
     let _ = sref.join_multicast_v6(&RING_GROUP, ifindex);
 }
 
+/// Backoff applied after a transient `recv_from` error to avoid a busy loop.
+const RECV_ERROR_BACKOFF: std::time::Duration = std::time::Duration::from_millis(50);
+
 /// Per-socket reader task: reads datagrams from `sock` and forwards them to `tx`.
 ///
 /// Also re-joins the multicast group every [`REJOIN_PERIOD`] so membership
 /// survives a link flap (cut/heal).
+///
+/// The reader **never** exits on a socket error.  A transient `ENETDOWN`,
+/// `EINTR`, or similar error is logged and the loop continues after a short
+/// backoff so the interface can recover on its own (the periodic multicast
+/// re-join re-establishes group membership when the link comes back).
 async fn reader_task(sock: UdpSocket, ifindex: u32, tx: mpsc::Sender<Inbound>) {
     let mut buf = vec![0u8; MAX_DGRAM];
     let mut rejoin = tokio::time::interval(REJOIN_PERIOD);
@@ -160,8 +168,18 @@ async fn reader_task(sock: UdpSocket, ifindex: u32, tx: mpsc::Sender<Inbound>) {
             r = sock.recv_from(&mut buf) => match r {
                 Ok(pair) => pair,
                 Err(e) => {
-                    tracing::error!("Udp6Transport reader[iface={}]: {}", ifindex, e);
-                    break;
+                    tracing::warn!(
+                        iface = ifindex,
+                        errno = %e,
+                        "Udp6Transport reader[iface={}]: recv_from error (will retry): {}",
+                        ifindex, e,
+                    );
+                    // Brief backoff to avoid a tight error-loop if the condition
+                    // persists (e.g. ENETDOWN while a link is down).  The reader
+                    // stays alive so it automatically recovers when the link
+                    // comes back and the periodic rejoin re-establishes multicast.
+                    tokio::time::sleep(RECV_ERROR_BACKOFF).await;
+                    continue;
                 }
             },
         };
@@ -186,6 +204,32 @@ async fn reader_task(sock: UdpSocket, ifindex: u32, tx: mpsc::Sender<Inbound>) {
     }
 }
 
+/// Aggregate per-interface send results into a single `io::Result<()>`.
+///
+/// - Returns `Ok(())` if **at least one** interface succeeded.
+/// - Returns an `Err` if **all** interfaces failed (or if `results` is empty,
+///   which means there are no interfaces to send on — treated as an error so
+///   the caller can log and observe that the node is isolated).
+/// - The error message on all-fail summarises how many interfaces failed.
+pub(crate) fn aggregate_send(results: &[(u32, io::Result<usize>)]) -> io::Result<()> {
+    if results.is_empty() {
+        return Err(io::Error::new(
+            io::ErrorKind::NotConnected,
+            "Udp6Transport: no interfaces to send on",
+        ));
+    }
+    let any_ok = results.iter().any(|(_, r)| r.is_ok());
+    if any_ok {
+        return Ok(());
+    }
+    // All failed — synthesise a summary error.
+    let n = results.len();
+    Err(io::Error::new(
+        io::ErrorKind::Other,
+        format!("Udp6Transport: all {} interface(s) failed to send", n),
+    ))
+}
+
 #[async_trait::async_trait]
 impl Transport for Udp6Transport {
     async fn recv(&mut self) -> io::Result<Inbound> {
@@ -198,15 +242,78 @@ impl Transport for Udp6Transport {
     }
 
     async fn send(&self, data: &[u8]) -> io::Result<()> {
-        // The multicast destination: RING_GROUP:PORT scoped to each interface.
+        // Send to EVERY interface independently, collecting per-iface results.
+        // One bad interface must not suppress emission on the healthy others.
+        let mut results: Vec<(u32, io::Result<usize>)> =
+            Vec::with_capacity(self.sockets.len());
         for (ifindex, sock) in &self.sockets {
             let dest = SocketAddrV6::new(RING_GROUP, PORT, 0, *ifindex);
-            sock.send_to(data, dest).await?;
+            let r = sock.send_to(data, dest).await;
+            if let Err(ref e) = r {
+                tracing::warn!(
+                    iface = ifindex,
+                    errno = %e,
+                    "Udp6Transport send[iface={}]: send_to error: {}",
+                    ifindex, e,
+                );
+            }
+            results.push((*ifindex, r));
         }
-        Ok(())
+        aggregate_send(&results)
     }
 
     fn interfaces(&self) -> Vec<u32> {
         self.sockets.iter().map(|(iface, _)| *iface).collect()
+    }
+}
+
+// ─────────────────────────────────── tests ───────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn ok_result(iface: u32) -> (u32, io::Result<usize>) {
+        (iface, Ok(64))
+    }
+
+    fn err_result(iface: u32) -> (u32, io::Result<usize>) {
+        (
+            iface,
+            Err(io::Error::new(io::ErrorKind::NetworkDown, "ENETDOWN")),
+        )
+    }
+
+    /// All interfaces succeeded → Ok.
+    #[test]
+    fn aggregate_send_all_ok_returns_ok() {
+        let results = vec![ok_result(1), ok_result(2), ok_result(3)];
+        assert!(aggregate_send(&results).is_ok());
+    }
+
+    /// Some interfaces failed but at least one succeeded → Ok.
+    #[test]
+    fn aggregate_send_mixed_returns_ok() {
+        let results = vec![err_result(1), ok_result(2), err_result(3)];
+        assert!(aggregate_send(&results).is_ok());
+    }
+
+    /// Every interface failed → Err.
+    #[test]
+    fn aggregate_send_all_err_returns_err() {
+        let results = vec![err_result(1), err_result(2)];
+        let e = aggregate_send(&results).unwrap_err();
+        assert!(
+            e.to_string().contains("all"),
+            "error message should mention 'all': {}",
+            e
+        );
+    }
+
+    /// No interfaces → Err (node is isolated, no send possible).
+    #[test]
+    fn aggregate_send_empty_returns_err() {
+        let results: Vec<(u32, io::Result<usize>)> = vec![];
+        assert!(aggregate_send(&results).is_err());
     }
 }

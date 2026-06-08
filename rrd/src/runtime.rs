@@ -271,7 +271,9 @@ impl<T: Transport> Daemon<T> {
                     let now = self.now();
                     let out = self.engine.step(now);
                     let encoded = wire::encode(&out.emit);
-                    let _ = self.transport.send(&encoded).await;
+                    if let Err(e) = self.transport.send(&encoded).await {
+                        tracing::warn!("transport send error (all interfaces failed): {}", e);
+                    }
                     let snap = self.build_snapshot();
                     let _ = self.rib_tx.send(snap);
                     // FIB reconcile after each tick.
