@@ -277,6 +277,34 @@ lab_link_set() {
     nsx "$lo" ip link set "$(veth_a "$lo")" "$state"
 }
 
+# ── lab_link_netem <i> <j> <loss%> <delay_ms> ────────────────────────────────
+# Apply (or clear, with 0 0) a tc netem qdisc to BOTH ends of the link between
+# adjacent nodes i and j, so impairment is symmetric. Requires CAP_NET_ADMIN —
+# the lab's user namespace has it. With loss=0 delay=0 the qdisc is removed
+# (link returns to clean). Tolerant of an already-absent qdisc on a clear.
+lab_link_netem() {
+    local i="$1"; local j="$2"; local loss="$3"; local delay="$4"
+    local lo hi
+    if [ "$i" -lt "$j" ]; then lo="$i"; hi="$j"; else lo="$j"; hi="$i"; fi
+    local a; a="$(veth_a "$lo")"   # end in ring$lo
+    local b; b="$(veth_b "$lo")"   # end in ring$hi
+
+    if [ "$loss" = "0" ] && [ "$delay" = "0" ]; then
+        # Clear: remove the root netem qdisc from both ends (ignore "no such qdisc").
+        nsx "$lo" tc qdisc del dev "$a" root 2>/dev/null || true
+        nsx "$hi" tc qdisc del dev "$b" root 2>/dev/null || true
+        return 0
+    fi
+
+    # Build the netem clause set, omitting a clause whose value is 0.
+    local -a clauses=()
+    [ "$loss" != "0" ]  && clauses+=("loss" "${loss}%")
+    [ "$delay" != "0" ] && clauses+=("delay" "${delay}ms")
+    # `replace` is idempotent (creates or updates the root qdisc).
+    nsx "$lo" tc qdisc replace dev "$a" root netem "${clauses[@]}" 2>/dev/null || true
+    nsx "$hi" tc qdisc replace dev "$b" root netem "${clauses[@]}" 2>/dev/null || true
+}
+
 # ── CLI dispatch when run directly ───────────────────────────────────────────
 # Direct invocation re-execs into a user+net namespace, builds the lab, and
 # (for `up`) sleeps so the operator can inspect it from inside the same userns.
