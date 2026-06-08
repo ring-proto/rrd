@@ -30,7 +30,14 @@ pub fn render(frame: &mut Frame, state: &LabState) {
     render_nodes(frame, left[0], state);
     render_log(frame, left[1], state);
     render_topology(frame, right[0], state);
-    render_inspector(frame, right[1], state);
+    // The bottom-right pane shows the inspector, or — when live traffic is
+    // running — a live traffic pane (per-leg bars + multipath verdict), since
+    // that is what the user most wants to watch move.
+    if state.traffic.is_some() {
+        render_traffic(frame, right[1], state);
+    } else {
+        render_inspector(frame, right[1], state);
+    }
 }
 
 fn selected_node(state: &LabState) -> Option<usize> {
@@ -175,6 +182,60 @@ fn render_inspector(frame: &mut Frame, area: Rect, state: &LabState) {
     frame.render_widget(para, area);
 }
 
+/// Live traffic pane: the active flow, the source route's ECMP next-hop count
+/// (the honest multipath signal), and a live bar per transit leg in pps. Shown
+/// in place of the inspector while continuous traffic is running.
+fn render_traffic(frame: &mut Frame, area: Rect, state: &LabState) {
+    let mut lines: Vec<Line> = Vec::new();
+    if let Some(t) = &state.traffic {
+        lines.push(Line::from(vec![
+            Span::styled("flow ", Style::default().add_modifier(Modifier::BOLD)),
+            Span::raw(format!("{} → {}  x{} flows", t.from, t.to, t.flows)),
+        ]));
+        let (verdict, vcolor) = if t.dest_nexthops >= 2 {
+            (
+                format!("MULTIPATH ({} next-hops)", t.dest_nexthops),
+                Color::Green,
+            )
+        } else {
+            (
+                format!("single path ({} next-hop)", t.dest_nexthops),
+                Color::Yellow,
+            )
+        };
+        lines.push(Line::from(vec![
+            Span::raw("route: "),
+            Span::styled(verdict, Style::default().fg(vcolor)),
+        ]));
+        lines.push(Line::raw(""));
+        let max = t.legs.iter().map(|l| l.pps).max().unwrap_or(0).max(1);
+        for leg in &t.legs {
+            let bar_len = ((leg.pps as f64 / max as f64) * 30.0).round() as usize;
+            let bar = "█".repeat(bar_len);
+            let color = if leg.pps > 0 {
+                Color::Cyan
+            } else {
+                Color::DarkGray
+            };
+            lines.push(Line::from(vec![
+                Span::raw(format!("{:<14} ", leg.leg)),
+                Span::styled(format!("{:>5} ", leg.pps), Style::default().fg(color)),
+                Span::styled(bar, Style::default().fg(color)),
+            ]));
+        }
+        let active = t.legs.iter().filter(|l| l.pps > 0).count();
+        lines.push(Line::raw(""));
+        lines.push(Line::raw(format!(
+            "{active}/{} legs carrying  (pps; press t to stop)",
+            t.legs.len()
+        )));
+    }
+    let para = Paragraph::new(lines)
+        .block(Block::default().borders(Borders::ALL).title("Live Traffic"))
+        .wrap(Wrap { trim: true });
+    frame.render_widget(para, area);
+}
+
 fn render_log(frame: &mut Frame, area: Rect, state: &LabState) {
     // Show the most recent events that fit; newest at the bottom.
     let height = area.height.saturating_sub(2) as usize; // borders
@@ -268,5 +329,31 @@ mod tests {
         let text = render_to_string(&state, 80, 24);
         assert!(text.contains("Nodes"));
         assert!(text.contains("nothing selected"));
+    }
+
+    #[test]
+    fn live_traffic_pane_shows_legs_and_multipath_verdict() {
+        use crate::lab::state::{TrafficLeg, TrafficView};
+        let mut state = LabState::from_topology(Topology::diamond());
+        state.traffic = Some(TrafficView {
+            from: "ring0".into(),
+            to: "ring3".into(),
+            flows: 8,
+            dest_nexthops: 2,
+            legs: vec![
+                TrafficLeg {
+                    leg: "ring1:v0_1".into(),
+                    pps: 40,
+                },
+                TrafficLeg {
+                    leg: "ring2:v1_1".into(),
+                    pps: 38,
+                },
+            ],
+        });
+        let text = render_to_string(&state, 120, 40);
+        assert!(text.contains("Live Traffic"), "traffic pane title");
+        assert!(text.contains("MULTIPATH"), "multipath verdict shown");
+        assert!(text.contains("ring1:v0_1"), "leg label shown");
     }
 }

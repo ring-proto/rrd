@@ -185,7 +185,7 @@ fn rrd_bin() -> std::path::PathBuf {
 /// `ip` prints a single-path route with the gateway inline (no `nexthop`
 /// keyword → 1 hop) and a multipath route as a header line followed by one
 /// `nexthop ...` line per leg. Mirrors the harness's `route_nexthops`.
-fn count_route_nexthops(routes_text: &str, prefix: &str) -> usize {
+pub(crate) fn count_route_nexthops(routes_text: &str, prefix: &str) -> usize {
     // Find the route block beginning at the line that starts with the prefix.
     let mut lines = routes_text.lines().peekable();
     while let Some(line) = lines.next() {

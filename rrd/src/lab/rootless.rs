@@ -39,6 +39,12 @@ pub struct RootlessBackend {
     plan: LabPlan,
     members: BTreeMap<String, Member>,
     realized: bool,
+    /// Continuous-traffic state: running ping children, the source addresses
+    /// added on the source's dum0 (with prefix length, for cleanup), and the
+    /// active (from, to, flows) tuple. Empty/None when traffic is off.
+    traffic_pings: Vec<Child>,
+    traffic_srcs: Vec<String>,
+    traffic_active: Option<(String, String, usize)>,
 }
 
 impl RootlessBackend {
@@ -53,6 +59,9 @@ impl RootlessBackend {
             plan: LabPlan::default(),
             members: BTreeMap::new(),
             realized: false,
+            traffic_pings: Vec::new(),
+            traffic_srcs: Vec::new(),
+            traffic_active: None,
         }
     }
 
@@ -169,6 +178,149 @@ impl RootlessBackend {
         Self::nsx(pid, &["ip", "-6", "addr", "add", &addr, "dev", "dum0"]).await?;
         Self::nsx(pid, &["ip", "link", "set", "dum0", "up"]).await?;
         Ok(())
+    }
+
+    // ───────────────────── continuous live traffic ──────────────────────────
+    // The one-shot `traffic` method (LabBackend) sends a bounded burst and
+    // reports the split. For the interactive TUI we want traffic that *keeps
+    // flowing* until stopped, so the field's live response (cut/heal, ECMP
+    // reweighting) is visible as it happens. `start_traffic` adds per-flow source
+    // addresses (the IPv6 ECMP hash keys) and launches one long-running `ping6
+    // -i 0.2` child per source inside the source node's netns; `stop_traffic`
+    // kills them and removes the addresses. Rates are sampled by the engine via
+    // `iface_tx` deltas between ticks.
+
+    /// Whether continuous traffic is currently running.
+    pub fn traffic_running(&self) -> bool {
+        self.traffic_active.is_some()
+    }
+
+    /// The active (from, to, flows) tuple, if traffic is running.
+    pub fn traffic_spec(&self) -> Option<(String, String, usize)> {
+        self.traffic_active.clone()
+    }
+
+    /// Start continuous traffic from node `from` to node/host `to` using `flows`
+    /// distinct source addresses. Idempotent-ish: stops any existing flow first.
+    pub async fn start_traffic(&mut self, from: &str, to: &str, flows: usize) -> BackendResult<()> {
+        if !self.realized {
+            return Err(BackendError("no topology realized".into()));
+        }
+        self.stop_traffic().await;
+
+        let src = self
+            .plan
+            .nodes
+            .iter()
+            .find(|n| n.name == from)
+            .ok_or_else(|| BackendError(format!("no such source node: {from}")))?
+            .clone();
+        let dst_addr = self
+            .plan
+            .nodes
+            .iter()
+            .find(|n| n.name == to)
+            .map(|n| n.host_addr.clone())
+            .or_else(|| {
+                self.plan
+                    .hosts
+                    .iter()
+                    .find(|h| h.name == to)
+                    .map(|h| h.address.split('/').next().unwrap_or("").to_string())
+            })
+            .ok_or_else(|| BackendError(format!("no such destination: {to}")))?;
+        let src_pid = self.member(from)?.ns_pid;
+        let plen = src.prefix.split('/').nth(1).unwrap_or("64").to_string();
+
+        let n = flows.max(1);
+        let mut srcs = Vec::with_capacity(n);
+        for i in 0..n {
+            let s = crate::lab::netns::prefix_host(&src.prefix, 0x10 + i as u32);
+            let with_len = format!("{s}/{plen}");
+            Self::nsx_try(
+                src_pid,
+                &["ip", "-6", "addr", "add", &with_len, "dev", "dum0"],
+            )
+            .await;
+            srcs.push((s, with_len));
+        }
+        // Brief settle so the source addresses are usable before pings start.
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+
+        // Launch one long-running ping per source. ping6 with no -c runs until
+        // killed; -i 0.2 is the unprivileged interval floor.
+        let mut pings = Vec::with_capacity(n);
+        for (s, _) in &srcs {
+            let child = Command::new("nsenter")
+                .arg("-t")
+                .arg(src_pid.to_string())
+                .arg("-n")
+                .arg("ping6")
+                .arg("-i")
+                .arg("0.2")
+                .arg("-I")
+                .arg(s)
+                .arg(&dst_addr)
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()?;
+            pings.push(child);
+        }
+
+        self.traffic_pings = pings;
+        self.traffic_srcs = srcs.into_iter().map(|(_, w)| w).collect();
+        self.traffic_active = Some((from.to_string(), to.to_string(), n));
+        Ok(())
+    }
+
+    /// Stop continuous traffic: kill the ping children and remove the extra
+    /// source addresses. Safe to call when nothing is running.
+    pub async fn stop_traffic(&mut self) {
+        for mut child in std::mem::take(&mut self.traffic_pings) {
+            let _ = child.start_kill();
+            let _ = child.wait().await;
+        }
+        if let Some((from, _, _)) = self.traffic_active.take() {
+            if let Ok(pid) = self.member(&from).map(|m| m.ns_pid) {
+                for with_len in std::mem::take(&mut self.traffic_srcs) {
+                    Self::nsx_try(pid, &["ip", "-6", "addr", "del", &with_len, "dev", "dum0"])
+                        .await;
+                }
+            }
+        }
+        self.traffic_srcs.clear();
+    }
+
+    // ───────────────── read-only sampling helpers (&self) ───────────────────
+    // The live engine samples state on a tick while holding only a shared ref
+    // during the read phase. These mirror the LabBackend methods but take &self.
+
+    /// Read a node's installed proto-ring routes without &mut.
+    pub async fn routes_ref(&self, node: &str) -> BackendResult<String> {
+        let pid = self.member(node)?.ns_pid;
+        Self::nsx_out(pid, &["ip", "-6", "route", "show", "proto", "155"]).await
+    }
+
+    /// Whether `dev` in `member`'s netns is administratively up. Used to sample
+    /// segment liveness after cut/heal. Returns true if it can't tell.
+    pub async fn link_is_up(&self, member: &str, dev: &str) -> bool {
+        let Ok(m) = self.member(member) else {
+            return true;
+        };
+        let out = Self::nsx_out(m.ns_pid, &["ip", "link", "show", dev])
+            .await
+            .unwrap_or_default();
+        // `ip link show` prints the flags in <...>; a down link lacks "UP" in
+        // the flag set (it shows e.g. <BROADCAST,MULTICAST> without UP).
+        // Match the admin flag, not oper-state, so a cut (set down) reads false.
+        if let Some(lt) = out.find('<') {
+            if let Some(gt) = out[lt..].find('>') {
+                let flags = &out[lt + 1..lt + gt];
+                return flags.split(',').any(|f| f == "UP");
+            }
+        }
+        true
     }
 }
 
@@ -555,6 +707,8 @@ impl LabBackend for RootlessBackend {
     }
 
     async fn cleanup(&mut self) -> BackendResult<()> {
+        // Stop any continuous traffic first (kills ping children).
+        self.stop_traffic().await;
         // Kill daemons first so they release netns sockets, then placeholders.
         let names: Vec<String> = self.members.keys().cloned().collect();
         for name in &names {

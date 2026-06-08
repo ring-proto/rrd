@@ -8,6 +8,7 @@ pub mod backend;
 pub mod cli;
 pub mod command;
 pub mod dryrun;
+pub mod engine;
 pub mod live;
 pub mod netns;
 pub mod rootless;

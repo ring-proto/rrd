@@ -50,6 +50,28 @@ pub enum Selection {
     Host(usize),
 }
 
+/// One transit leg's live throughput, keyed `"node:dev"`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TrafficLeg {
+    pub leg: String,
+    /// Packets-per-second observed on this leg over the last tick.
+    pub pps: u64,
+}
+
+/// Live view of the currently running traffic flow (None when traffic is off).
+/// Populated by the live engine; always None in the pure dry-run path.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TrafficView {
+    pub from: String,
+    pub to: String,
+    pub flows: usize,
+    /// Installed ECMP next-hops on the source's route to the destination — the
+    /// honest path-diversity signal (1 = single path, >=2 = multipath).
+    pub dest_nexthops: usize,
+    /// Per-leg rates, sorted descending by pps.
+    pub legs: Vec<TrafficLeg>,
+}
+
 /// One entry in the lab event log.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct LabEvent {
@@ -65,6 +87,8 @@ pub struct LabState {
     pub segments: Vec<SegmentRuntime>,
     pub selection: Option<Selection>,
     pub events: Vec<LabEvent>,
+    /// Live traffic view, set by the engine; None in dry-run / when off.
+    pub traffic: Option<TrafficView>,
 }
 
 impl LabState {
@@ -110,6 +134,7 @@ impl LabState {
             segments,
             selection,
             events: Vec::new(),
+            traffic: None,
         }
     }
 

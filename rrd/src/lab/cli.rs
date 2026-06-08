@@ -10,11 +10,18 @@
 //! `--topology` accepts an inline generator spec (`line:3`, `diamond`,
 //! `fat-tree:4`, `grid:3x3`, `mesh:5`). File-based specs arrive with Task 2.
 
-use crate::lab::app::{run_tui, App};
+use crate::lab::app::{run_tui, run_tui_live, App};
 use crate::lab::command::Generator;
 use crate::lab::runner::{self, generate};
 use crate::lab::state::LabState;
 use crate::lab::topology::Topology;
+
+/// Locate the daemon binary: `RRD_BIN` env, else this executable.
+fn rrd_bin() -> std::path::PathBuf {
+    std::env::var("RRD_BIN")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|_| std::env::current_exe().unwrap_or_else(|_| "rrd".into()))
+}
 
 /// Result of dispatching the lab subcommand.
 pub fn run(args: &[String]) -> anyhow::Result<()> {
@@ -23,6 +30,7 @@ pub fn run(args: &[String]) -> anyhow::Result<()> {
     let mut snapshot = false;
     let mut tui = false;
     let mut live = false;
+    let mut engine_probe = false;
     let mut from: Option<String> = None;
     let mut to: Option<String> = None;
     let mut flows: usize = 8;
@@ -50,6 +58,7 @@ pub fn run(args: &[String]) -> anyhow::Result<()> {
             "--snapshot-json" => snapshot = true,
             "--tui" => tui = true,
             "--live" => live = true,
+            "--engine-probe" => engine_probe = true,
             "--from" => {
                 from = Some(
                     it.next()
@@ -100,8 +109,9 @@ pub fn run(args: &[String]) -> anyhow::Result<()> {
         }
     }
 
-    // Live mode: re-exec into a user+net namespace (if needed), then drive the
-    // real rootless backend on a tokio runtime. This is the runnable payoff.
+    // Live mode: re-exec into a user+net namespace (if needed), then either
+    // drive the interactive engine-backed TUI (--tui --live) or run the headless
+    // measured demo (--live). This is the runnable payoff.
     if live {
         // Re-exec carries the ORIGINAL args verbatim so we land back here with
         // RRD_LAB_LIVE_INNER=1 set and identical flags.
@@ -110,6 +120,47 @@ pub fn run(args: &[String]) -> anyhow::Result<()> {
             Some(spec) => parse_topology_spec(spec)?,
             None => Topology::diamond(),
         };
+        topo.validate().map_err(|e| anyhow::anyhow!("{e}"))?;
+
+        if engine_probe {
+            // Headless smoke test of the live engine (no TTY): exercises the
+            // exact path the TUI drives and prints snapshots to stdout.
+            let cfg = crate::lab::engine::EngineConfig {
+                topology: topo,
+                rrd_bin: rrd_bin(),
+                log_dir: std::path::PathBuf::from(format!(
+                    "/tmp/rrd_lab_live.{}",
+                    nix::unistd::getuid().as_raw()
+                )),
+                tick_ms,
+                max_paths,
+                sample_ms: 500,
+            };
+            crate::lab::engine::probe(cfg, 4, 4);
+            return Ok(());
+        }
+
+        if tui {
+            // Interactive live TUI: spawn the engine, hand it to the loop.
+            let state = LabState::from_topology(topo.clone());
+            let cfg = crate::lab::engine::EngineConfig {
+                topology: topo,
+                rrd_bin: rrd_bin(),
+                log_dir: std::path::PathBuf::from(format!(
+                    "/tmp/rrd_lab_live.{}",
+                    nix::unistd::getuid().as_raw()
+                )),
+                tick_ms,
+                max_paths,
+                sample_ms: 500,
+            };
+            let mut app = App::new(state).live();
+            app.default_flows = flows;
+            let engine = crate::lab::engine::spawn(cfg);
+            run_tui_live(app, engine).map_err(|e| anyhow::anyhow!("tui: {e}"))?;
+            return Ok(());
+        }
+
         let opts = crate::lab::live::LiveOptions {
             topology: topo,
             from,
@@ -211,13 +262,20 @@ fn print_help() {
         "rrd lab — interactive / headless / LIVE rootless RING topology lab\n\
          \n\
          USAGE:\n\
+         \x20 rrd lab --tui --live [--topology <spec>]   LIVE interactive UI\n\
          \x20 rrd lab --live [--topology <spec>] [--from N --to N --flows K]\n\
-         \x20 rrd lab --tui [--topology <spec>]\n\
+         \x20 rrd lab --tui [--topology <spec>]          (dry-run UI)\n\
          \x20 rrd lab --topology <spec> [--snapshot-json]\n\
          \x20 rrd lab --script <file> [--snapshot-json]\n\
          \n\
          TOPOLOGY SPECS:\n\
          \x20 diamond | line:N | mesh:N | fat-tree:K | grid:WxH\n\
+         \n\
+         LIVE TUI KEYS:\n\
+         \x20 j/k move   t start/stop traffic   : command   q quit\n\
+         \x20 commands: cut <A> <B> | heal <A> <B> | stop <node> | start <node>\n\
+         \x20 The fabric comes up immediately — watch routes climb, cut a link\n\
+         \x20 and watch per-leg traffic shift live (no convergence wait).\n\
          \n\
          LIVE MODE (no sudo; re-execs into a user+net namespace):\n\
          \x20 builds real netns/veth/bridge fabric, starts an rrd daemon per\n\
