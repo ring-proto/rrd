@@ -46,12 +46,18 @@ async fn main() {
         }],
     };
 
-    println!("fibcheck: reconciling fd00:5e57::/64 via fe80::1 dev {} ...", oif);
+    println!(
+        "fibcheck: reconciling fd00:5e57::/64 via fe80::1 dev {} ...",
+        oif
+    );
     fib.reconcile(&[intent]).await;
 
     // Brief sleep so the kernel has processed the netlink response.
     tokio::time::sleep(std::time::Duration::from_millis(200)).await;
 
-    println!("installed: fd00:5e57::/64 via fe80::1 dev {} (proto 155/ring)", oif);
+    println!(
+        "installed: fd00:5e57::/64 via fe80::1 dev {} (proto 155/ring)",
+        oif
+    );
     println!("Run: ip -6 route show proto ring");
 }

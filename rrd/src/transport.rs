@@ -189,7 +189,10 @@ mod tests {
         // Verify metadata: iface should be node0's synthetic ifindex (1).
         assert_eq!(inbound.iface, 1);
         // src should be node0's synthetic fe80::0 address.
-        assert_eq!(inbound.src.ip(), &Ipv6Addr::new(0xfe80, 0, 0, 0, 0, 0, 0, 0));
+        assert_eq!(
+            inbound.src.ip(),
+            &Ipv6Addr::new(0xfe80, 0, 0, 0, 0, 0, 0, 0)
+        );
     }
 
     #[tokio::test]

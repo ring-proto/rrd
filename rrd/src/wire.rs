@@ -146,9 +146,7 @@ pub fn decode(buf: &[u8]) -> Result<Message, WireError> {
         }
 
         let pot = f64::from_be_bytes(
-            read_bytes(buf, &mut pos, 8)?
-                .try_into()
-                .unwrap(), // always 8 bytes
+            read_bytes(buf, &mut pos, 8)?.try_into().unwrap(), // always 8 bytes
         );
         if !pot.is_finite() || pot < 0.0 {
             return Err(WireError::BadValue(format!(
@@ -158,9 +156,7 @@ pub fn decode(buf: &[u8]) -> Result<Message, WireError> {
         }
 
         let vit = f64::from_be_bytes(
-            read_bytes(buf, &mut pos, 8)?
-                .try_into()
-                .unwrap(), // always 8 bytes
+            read_bytes(buf, &mut pos, 8)?.try_into().unwrap(), // always 8 bytes
         );
         if !vit.is_finite() || !(0.0..=1.0).contains(&vit) {
             return Err(WireError::BadValue(format!(

@@ -226,12 +226,7 @@ impl FibReconciler {
                     .build()
             }
         };
-        self.handle
-            .route()
-            .add(msg)
-            .replace()
-            .execute()
-            .await
+        self.handle.route().add(msg).replace().execute().await
     }
 
     /// Build and send an RTM_DELROUTE for the prefix (proto-tagged).
@@ -240,11 +235,7 @@ impl FibReconciler {
             .destination_prefix(prefix.addr, prefix.len)
             .protocol(self.proto)
             .build();
-        self.handle
-            .route()
-            .del(msg)
-            .execute()
-            .await
+        self.handle.route().del(msg).execute().await
     }
 }
 
@@ -298,4 +289,3 @@ mod tests {
         assert_eq!(ecmp_weights(&[]), Vec::<u8>::new());
     }
 }
-

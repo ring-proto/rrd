@@ -10,10 +10,10 @@
 //! live in the M3 netns lab (requires CAP_NET_ADMIN and/or root).
 
 use crate::transport::{Inbound, Transport};
+use socket2::{Domain, Protocol, SockAddr, Socket, Type};
 use std::io;
 use std::net::{Ipv6Addr, SocketAddrV6};
 use std::os::unix::io::{FromRawFd, IntoRawFd};
-use socket2::{Domain, Protocol, SockAddr, Socket, Type};
 use tokio::net::UdpSocket;
 use tokio::sync::mpsc;
 
@@ -92,9 +92,8 @@ fn make_socket(ifindex: u32) -> io::Result<UdpSocket> {
     // FIB route points out the wrong veth (unroutable).  Binding to the device
     // constrains both RX and TX to that interface, so the ifindex tag is always
     // correct.  We resolve the ifindex to a name for SO_BINDTODEVICE.
-    let ifname = nix::net::if_::if_indextoname(ifindex).map_err(|e| {
-        io::Error::other(format!("if_indextoname({}) failed: {}", ifindex, e))
-    })?;
+    let ifname = nix::net::if_::if_indextoname(ifindex)
+        .map_err(|e| io::Error::other(format!("if_indextoname({}) failed: {}", ifindex, e)))?;
     sock.bind_device(Some(ifname.as_bytes()))?;
 
     // Bind to [::]:PORT.  Combined with SO_BINDTODEVICE above, the socket only

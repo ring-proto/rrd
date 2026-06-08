@@ -44,7 +44,10 @@ pub async fn run_control_socket(
     }
 }
 
-pub async fn send_control_request(path: impl AsRef<Path>, request: ControlRequest) -> io::Result<()> {
+pub async fn send_control_request(
+    path: impl AsRef<Path>,
+    request: ControlRequest,
+) -> io::Result<()> {
     let payload = match request {
         ControlRequest::AddLocalOrigin { dest, prefix } => json!({
             "type": "add_local_origin",
@@ -67,8 +70,8 @@ pub async fn send_control_request(path: impl AsRef<Path>, request: ControlReques
                 let mut reader = BufReader::new(stream);
                 let mut line = String::new();
                 reader.read_line(&mut line).await?;
-                let response: serde_json::Value = serde_json::from_str(line.trim())
-                    .map_err(io::Error::other)?;
+                let response: serde_json::Value =
+                    serde_json::from_str(line.trim()).map_err(io::Error::other)?;
                 if response.get("type").and_then(|v| v.as_str()) == Some("ok") {
                     return Ok(());
                 }
@@ -108,8 +111,8 @@ async fn handle_stream(
 }
 
 fn parse_wire_request(line: &str) -> Result<LocalOriginCommand, String> {
-    let req: WireRequest = serde_json::from_str(line)
-        .map_err(|error| format!("invalid control request: {error}"))?;
+    let req: WireRequest =
+        serde_json::from_str(line).map_err(|error| format!("invalid control request: {error}"))?;
     match req.request_type.as_str() {
         "add_local_origin" => {
             if req.dest.is_empty() {

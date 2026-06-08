@@ -31,7 +31,10 @@ async fn control_socket_translates_add_and_remove_local_origin_requests() {
     {
         LocalOriginCommand::Add { dest, prefix } => {
             assert_eq!(dest.0, "pod:default/demo");
-            assert_eq!(prefix.addr, "fd00:ffff::1".parse::<std::net::Ipv6Addr>().unwrap());
+            assert_eq!(
+                prefix.addr,
+                "fd00:ffff::1".parse::<std::net::Ipv6Addr>().unwrap()
+            );
             assert_eq!(prefix.len, 128);
         }
         other => panic!("expected add command, got {other:?}"),

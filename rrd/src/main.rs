@@ -22,8 +22,7 @@ async fn main() -> anyhow::Result<()> {
 
     // Parse CLI and build the daemon config.
     let cli = Cli::parse();
-    let daemon_cfg =
-        DaemonConfig::from_cli(&cli).map_err(|e| anyhow::anyhow!("{}", e))?;
+    let daemon_cfg = DaemonConfig::from_cli(&cli).map_err(|e| anyhow::anyhow!("{}", e))?;
 
     tracing::info!(
         router_id = %daemon_cfg.router_id.0,
@@ -35,8 +34,8 @@ async fn main() -> anyhow::Result<()> {
     );
 
     // Build the real UDP transport (one socket per interface).
-    let transport = Udp6Transport::bind(&daemon_cfg.ifaces)
-        .context("failed to open UDP multicast sockets")?;
+    let transport =
+        Udp6Transport::bind(&daemon_cfg.ifaces).context("failed to open UDP multicast sockets")?;
 
     let control_socket = daemon_cfg.control_socket.clone();
 

@@ -246,7 +246,9 @@ async fn dynamic_local_origin_diffuses_and_withdraws() {
     );
 
     origin_controls[2]
-        .send(LocalOriginCommand::Remove { dest: pod_id.clone() })
+        .send(LocalOriginCommand::Remove {
+            dest: pod_id.clone(),
+        })
         .unwrap();
 
     assert!(
