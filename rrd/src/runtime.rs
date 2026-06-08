@@ -91,8 +91,6 @@ pub struct Daemon<T: Transport> {
     neighbor_by_addr: HashMap<(u32, Ipv6Addr), NeighborId>,
     /// Reverse map: NeighborId → (iface, src_ip) for M3 next-hop locator
     addr_by_neighbor: HashMap<NeighborId, (u32, Ipv6Addr)>,
-    /// Prefix → RouterId learned from wire messages, for RIB snapshot building.
-    prefix_to_rid: HashMap<Prefix, RouterId>,
     next_nid: u32,
     rib_tx: watch::Sender<RibSnapshot>,
     local_origin_rx: mpsc::UnboundedReceiver<LocalOriginCommand>,
@@ -141,9 +139,6 @@ impl<T: Transport> Daemon<T> {
         let engine = Engine::new(cfg.router_id.clone(), cfg.prefix, cfg.cfg, cfg.policy);
         let (rib_tx, rib_rx) = watch::channel(RibSnapshot::default());
         let (local_origin_tx, local_origin_rx) = mpsc::unbounded_channel();
-        // Pre-seed the prefix_to_rid with our own router-id.
-        let mut prefix_to_rid = HashMap::new();
-        prefix_to_rid.insert(cfg.prefix, cfg.router_id.clone());
 
         let daemon = Daemon {
             engine,
@@ -152,7 +147,6 @@ impl<T: Transport> Daemon<T> {
             start: Instant::now(),
             neighbor_by_addr: HashMap::new(),
             addr_by_neighbor: HashMap::new(),
-            prefix_to_rid,
             next_nid: 0,
             rib_tx,
             local_origin_rx,
@@ -223,18 +217,11 @@ impl<T: Transport> Daemon<T> {
                     return;
                 };
 
-                // Learn prefix → RouterId mapping from every advertised entry. The
-                // primary self-pin has dest == msg.from; dynamic local origins use
-                // their own destination ids.
-                for entry in &msg.delta {
-                    self.prefix_to_rid
-                        .entry(entry.prefix)
-                        .or_insert_with(|| entry.dest.clone());
-                }
-
                 // The engine enforces the untrusted-intern budget per-entry (Config::max_dests):
                 // over-budget destinations are silently skipped, and reach-ball GC reaps drained,
-                // dead, non-origin slots. No daemon-side cap is needed here.
+                // dead, non-origin slots. No daemon-side cap is needed here. The RIB snapshot's
+                // router-id for each routable prefix is read authoritatively from the engine's
+                // interned dest_key via DesiredRoute.dest — no untrusted prefix→rid learning here.
                 let now = self.now();
                 self.engine.ingest(now, nid, &msg);
             }
@@ -295,7 +282,6 @@ impl<T: Transport> Daemon<T> {
         match cmd {
             LocalOriginCommand::Add { dest, prefix } => {
                 self.engine.add_local_origin(dest.clone(), prefix);
-                self.prefix_to_rid.insert(prefix, dest.clone());
                 tracing::info!(
                     dest = %dest.0,
                     prefix = %format!("{}/{}", prefix.addr, prefix.len),
@@ -360,14 +346,13 @@ impl<T: Transport> Daemon<T> {
 
     /// Build a RIB snapshot from a pre-computed `desired_routes` slice.
     fn build_snapshot_from(&self, desired: &[DesiredRoute]) -> RibSnapshot {
+        // The router-id for each routable prefix comes authoritatively from the engine's interned
+        // slot (`DesiredRoute.dest`, i.e. `dest_key[d]`) — not a separate, untrusted prefix→rid
+        // map. For a remote dest this IS the advertised destination router-id.
         let routable: Vec<(RouterId, Prefix)> = desired
             .iter()
             .filter(|r| r.routable)
-            .filter_map(|r| {
-                self.prefix_to_rid
-                    .get(&r.prefix)
-                    .map(|rid| (rid.clone(), r.prefix))
-            })
+            .map(|r| (r.dest.clone(), r.prefix))
             .collect();
         tracing::debug!("RIB snapshot: {} routable dests", routable.len());
         let routes = if self.fib_active {

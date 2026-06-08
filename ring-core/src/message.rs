@@ -48,10 +48,12 @@ pub struct Route {
     pub routable: bool,
 }
 
-/// The FIB reconciler's view of one destination: where to install, weighted next-hops (capped
-/// by `ForwardingPolicy.max_paths`), and whether it should be installed at all.
+/// The FIB reconciler's view of one destination: its router-id (the authoritative origin identity
+/// from the engine's interned slot), where to install, weighted next-hops (capped by
+/// `ForwardingPolicy.max_paths`), and whether it should be installed at all.
 #[derive(Clone, Debug)]
 pub struct DesiredRoute {
+    pub dest: RouterId,
     pub prefix: Prefix,
     pub nexthops: SmallVec<[WeightedHop; 4]>,
     pub routable: bool,

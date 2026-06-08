@@ -563,6 +563,7 @@ impl Engine {
                 .copied()
                 .collect();
             Some(DesiredRoute {
+                dest: self.dest_key[d].clone(),
                 prefix: self.dest_prefix[d],
                 nexthops,
                 routable: v >= self.cfg.phi,
