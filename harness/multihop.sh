@@ -20,19 +20,13 @@
 #
 #   bash harness/multihop.sh            # 5-node line (4 hops)
 #   NODES=7 bash harness/multihop.sh    # 7-node line (6 hops)
-#   HEAL_WAIT=90 bash harness/multihop.sh   # override any timeout via env
+#   HEAL_WAIT=40 bash harness/multihop.sh   # override any timeout via env
 #
-# ── A note on reconvergence speed (the aligned default's reach↔speed trade-off) ──
-# The daemon's default is horizon-aligned to a LONG reach (κ=0.01 ⟹ λ=R_V=10, ~9 hops).
-# The screened-Poisson field relaxes at a rate that scales with κ, so a SMALL κ (long
-# reach) converges SLOWLY. Empirically, healing a cut on a 4-hop line reconverges with
-# high variance (~observed seconds to tens of seconds), dominated by the field relaxation
-# at κ=0.01 plus the ~1s multicast re-join after the link flap. The waits below are
-# therefore generous and poll (wait_ping returns the instant the path is up, so fast
-# reconvergences finish quickly). A deployment that needs FAST failover over a SHORT
-# diameter should raise κ (shorter reach, faster convergence) — the aligned default
-# optimizes reach. This is a tuning trade-off, not a bug: the cut/heal cycle is correct,
-# just paced by κ.
+# Reconvergence is fast (a controlled cut/heal recovers in ~1-2s). The healed-link route is
+# restored by the daemon's periodic full FIB re-assert (the kernel flushes routes via a downed
+# link; the reconciler re-asserts the desired set every couple of seconds so a kernel-flushed
+# route never lingers after a heal). Waits below are polled (wait_ping returns the instant the
+# path is up) with a little margin for the multicast re-join.
 
 set -u
 
@@ -41,11 +35,10 @@ REPO_ROOT="$(cd "${MH_DIR}/.." && pwd)"
 RRD_BIN="${RRD_BIN:-${REPO_ROOT}/target/release/rrd}"
 
 # ── Tunables (generous: a longer line converges and reconverges more slowly) ──
-CONVERGE_TIMEOUT="${CONVERGE_TIMEOUT:-25}"  # seconds to wait for initial multi-hop route install
+CONVERGE_TIMEOUT="${CONVERGE_TIMEOUT:-20}"  # seconds to wait for initial multi-hop route install
 SEVER_WAIT="${SEVER_WAIT:-8}"               # seconds to wait for a cut to propagate (withdraw)
-HEAL_WAIT="${HEAL_WAIT:-60}"                # seconds to wait for a heal to reconverge — GENEROUS:
-                                            # slow + high-variance at the aligned default's small κ
-                                            # (reach↔speed trade-off, see header). wait_ping returns early.
+HEAL_WAIT="${HEAL_WAIT:-20}"                # seconds to wait for a heal to reconverge (recovery is
+                                            # ~1-2s; margin covers the multicast re-join). wait_ping returns early.
 PING_COUNT=3
 PING_W=1
 NODES="${NODES:-5}"
@@ -182,22 +175,19 @@ if wait_ping 0 "$FAR" "$HEAL_WAIT"; then
     pass "${LAST}-hop ping delivers again after the heal"
 else
     fail "ping does not deliver after the heal"
-    # Diagnostic: where did reconvergence stall? Dump every node's forward route to the
-    # far prefix and reverse route to ring0, and probe each hop ring0→ringK individually.
-    echo "--- DIAG: per-node routes after heal ---"
+    echo "--- DIAG: healed link (ring$((LAST-1))—ring${LAST}) interface state ---"
+    nsx $((LAST - 1)) ip -6 -br addr show 2>/dev/null | grep -iE 'veth' || true
+    nsx "$LAST" ip -6 -br addr show 2>/dev/null | grep -iE 'veth' || true
+    echo "--- DIAG: per-node neighbour count + far/reverse routes ---"
     for i in $(seq 0 "$LAST"); do
-        echo "ring${i} forward(${FAR_PFX}): $(nsx "$i" ip -6 route show proto 155 | grep -oE "fd00:a${LAST}::/64[^
-]*" | head -1 | tr -s ' ')"
-        echo "ring${i} reverse(${RING0_PFX}): $(nsx "$i" ip -6 route show proto 155 | grep -oE "fd00:a0::/64[^
-]*" | head -1 | tr -s ' ')"
+        nb="$(tail -5 "${LOG_DIR}/n${i}.log" 2>/dev/null | grep -oE 'neighbors=[0-9]+' | tail -1)"
+        fwd="$(nsx "$i" ip -6 route show proto 155 2>/dev/null | grep -c "fd00:a${LAST}::/64")"
+        rev="$(nsx "$i" ip -6 route show proto 155 2>/dev/null | grep -c 'fd00:a0::/64')"
+        echo "ring${i}: ${nb:-neighbors=?}  has_far=${fwd}  has_reverse=${rev}"
     done
     echo "--- DIAG: per-hop ping ring0 -> ring{1..${LAST}} ---"
     for i in $(seq 1 "$LAST"); do
-        if nsx 0 ping6 -c 1 -W 1 "fd00:a${i}::1" >/dev/null 2>&1; then
-            echo "ring0 -> ring${i} ($i hop): OK"
-        else
-            echo "ring0 -> ring${i} ($i hop): UNREACHABLE"
-        fi
+        if nsx 0 ping6 -c 1 -W 1 "fd00:a${i}::1" >/dev/null 2>&1; then echo "ring0 -> ring${i} ($i hop): OK"; else echo "ring0 -> ring${i} ($i hop): UNREACHABLE"; fi
     done
 fi
 

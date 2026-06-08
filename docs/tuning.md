@@ -77,27 +77,27 @@ rrd --prefix … --iface … --kappa <κ> --alpha <α> --phi 0.5
 
 (Leave a hop of margin: to *reliably* route `M` hops choose `N ≥ M + 1`.)
 
-## The reach ↔ convergence-speed trade-off
+## Convergence and failover
 
-The screened-Poisson relaxation that solves `f` converges at a rate that scales with `κ`
-(larger `κ` ⇒ more diagonally dominant ⇒ faster contraction). So:
+Convergence is fast in practice: a controlled cut/heal on a multi-hop line reconverges in
+**~1–2 s** at the default `κ = 0.01` (measured; `make multihop`). Mathematically the
+screened-Poisson relaxation that solves `f` does contract faster at larger `κ` (more diagonal
+dominance), so a much smaller `κ` than the default would eventually relax more slowly — but at
+the shipped scales the relaxation is not the bottleneck.
 
-- **Small `κ` (long reach)** converges **slowly**. Healing a cut on a multi-hop path can take
-  *seconds to tens of seconds* to fully reconverge at the default `κ = 0.01`, with high variance
-  (the async relaxation schedule plus the ~1 s multicast re-join after a link flap). The
-  `harness/multihop.sh` validation uses a generous, poll-based heal window for exactly this
-  reason — correctness is unaffected, only the pace.
-- **Large `κ` (short reach)** converges **fast**.
+Two implementation details keep failover prompt:
 
-Choose by what your deployment values:
+- **Kernel-flush re-assert.** When a link goes down the kernel silently flushes the routes whose
+  next-hop lived on it. The FIB reconciler trusts its own bookkeeping for the cheap incremental
+  path, so it re-asserts the *full* desired set every couple of seconds (idempotent `REPLACE`) to
+  restore any kernel-flushed route after a heal. Without this, a node adjacent to a flap could
+  keep a stale "installed" record and never re-install the route the kernel dropped.
+- **Multicast re-join.** A flapped interface loses its IPv6 multicast membership; the daemon
+  re-joins on a ~1 s timer, so neighbour discovery across a healed link resumes within ~1 s.
 
-- **Reach over speed** (large diameter, failover latency tolerable): keep `κ` small (the default).
-- **Speed over reach** (small diameter, fast failover required): raise `κ` (shorter `λ`/`R_V`),
-  re-deriving the aligned `α = √(κ/D)`. E.g. a 4-hop network with fast failover: `κ = 0.0625,
-  α = 0.25, φ = 0.5` (`λ = R_V = 4`) converges markedly faster than the default.
-
-There is no setting that is both maximally long-reaching and maximally fast — it is the physics of
-the field, not an implementation limit.
+If you tune for a very large diameter (`κ` far below the default), keep an eye on cold-start
+convergence time and raise the emission rate (`--tick-ms` smaller) if needed — the horizons above
+are tick-independent, but wall-clock convergence scales with the tick.
 
 ## Other knobs
 

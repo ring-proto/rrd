@@ -75,6 +75,13 @@ pub struct RibSnapshot {
 /// Wall-clock period between periodic structured status log lines.
 const STATUS_LOG_PERIOD: std::time::Duration = std::time::Duration::from_secs(5);
 
+/// How often to force a FULL FIB re-assert (re-install every desired route) regardless of the
+/// dirty-check. The kernel silently flushes our routes when a link goes down; our bookkeeping
+/// still claims them installed, so the incremental reconcile never restores them after a heal.
+/// A periodic full re-assert (idempotent REPLACE) bounds the time a kernel-flushed route stays
+/// missing to one period. See `FibReconciler::reconcile_full`.
+const FULL_RECONCILE_PERIOD: std::time::Duration = std::time::Duration::from_secs(2);
+
 /// Runtime command for destinations dynamically originated by this node.
 #[derive(Clone, Debug)]
 pub enum LocalOriginCommand {
@@ -351,6 +358,8 @@ impl<T: Transport> Daemon<T> {
         let mut last_status = self.start.elapsed();
         let mut prev_rx: u64 = 0;
         let mut prev_decode: u64 = 0;
+        // Last wall-clock instant we forced a FULL FIB re-assert (kernel-flush safety net).
+        let mut last_full_reconcile = self.start.elapsed();
 
         loop {
             tokio::select! {
@@ -382,35 +391,44 @@ impl<T: Transport> Daemon<T> {
                     // double iteration of the destination table).
                     let desired: Vec<DesiredRoute> = self.engine.desired_routes(now).collect();
 
-                    // FIB reconcile ONLY when the canonical intent set changed since
-                    // the last reconcile (#13). In steady state this is a cheap Vec
-                    // comparison with no netlink round-trip and no `.await`, so an
-                    // unchanged route set never yields the select! loop on the FIB
-                    // path (mitigating the inline-await stall, #14).
+                    // FIB reconcile on change (#13) — a cheap Vec comparison in steady state,
+                    // no netlink round-trip and no `.await`, so an unchanged route set never
+                    // yields the select! loop on the FIB path (mitigating the inline-await
+                    // stall, #14). PLUS a periodic FULL re-assert: the kernel flushes our routes
+                    // when a link goes down, but our bookkeeping still claims them installed, so
+                    // the dirty-check alone would never restore a kernel-flushed route after a
+                    // heal. Forcing a full re-assert every FULL_RECONCILE_PERIOD bounds that gap.
                     if self.fib.is_some() {
                         let mut intents = self.build_route_intents_from(&desired);
                         canonicalize_intents(&mut intents);
-                        if intents != self.last_intents {
-                            // `build_route_intents_from` (an immutable borrow of
-                            // `self`) has returned an owned Vec, so taking the
-                            // `&mut self.fib` borrow only now is sound; it ends
-                            // before the cumulative-counter updates below.
+                        let elapsed = self.start.elapsed();
+                        let force_full =
+                            elapsed.saturating_sub(last_full_reconcile) >= FULL_RECONCILE_PERIOD;
+                        if force_full || intents != self.last_intents {
+                            // `build_route_intents_from` (an immutable borrow of `self`) has
+                            // returned an owned Vec, so taking the `&mut self.fib` borrow only
+                            // now is sound; it ends before the cumulative-counter updates below.
                             let stats = if let Some(fib) = self.fib.as_mut() {
-                                fib.reconcile(&intents).await
+                                if force_full {
+                                    fib.reconcile_full(&intents).await
+                                } else {
+                                    fib.reconcile(&intents).await
+                                }
                             } else {
                                 crate::fib::ReconcileStats::default()
                             };
                             self.fib_ops += stats.ops as u64;
                             self.fib_errors += stats.errors as u64;
-                            // Only memoise the desired set as "applied" when the
-                            // reconcile FULLY succeeded. If any op failed, leave
-                            // `last_intents` stale so the next tick re-attempts it
-                            // (the reconciler diffs against its own `installed`
-                            // map, so it retries only the failed ops). This keeps
-                            // the reconciler's idempotent "retry on next tick"
-                            // contract intact despite the dirty-check skip (#13).
+                            // Only memoise the desired set as "applied" when the reconcile FULLY
+                            // succeeded. If any op failed, leave `last_intents` stale so the next
+                            // tick re-attempts it (the reconciler diffs against its own
+                            // `installed` map, so it retries only the failed ops) — preserving
+                            // the idempotent "retry on next tick" contract despite the skip (#13).
                             if stats.errors == 0 {
                                 self.last_intents = intents;
+                            }
+                            if force_full {
+                                last_full_reconcile = elapsed;
                             }
                         }
                     }
