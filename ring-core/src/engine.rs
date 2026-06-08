@@ -1200,6 +1200,135 @@ mod tests {
         );
     }
 
+    // ── neighbour reclamation (#24/#4): silent peers are pruned ──────────
+
+    #[test]
+    fn silent_neighbour_is_pruned_after_aging_below_floor() {
+        // A neighbour that goes silent forever must be reclaimed once its link
+        // conductance has aged at or below `floor` (the Hears-echo horizon) and
+        // it backs no route. With defaults g_eff = age(α, d, k) ≤ floor needs
+        // k ≈ 44_718 ticks; a single jump to tick*60_000 clears both that and
+        // the gc_dwell (live_at is only refreshed on steps/ingest).
+        let cfg = Config::default();
+        let mut a = Engine::new(RouterId::from("a"), px(1), cfg, Default::default());
+        a.add_neighbor(NeighborId(1));
+        // Ingest one message at the base time so heard/live_at are set there.
+        let msg = Message {
+            from: RouterId::from("b"),
+            hears: vec![RouterId::from("a")],
+            delta: vec![Entry {
+                dest: RouterId::from("b"),
+                prefix: px(2),
+                pot: cfg.f0,
+                vit: 1.0,
+            }],
+        };
+        a.ingest(Duration::ZERO, NeighborId(1), &msg);
+        // Step at the base time: the peer is fresh, so it is alive.
+        a.step(Duration::ZERO);
+        assert_eq!(a.neighbor_count(), 1, "fresh peer is retained");
+
+        // Jump far past the floor horizon AND the dwell: the peer is pruned.
+        let out = a.step(cfg.tick * 60_000);
+        assert_eq!(a.neighbor_count(), 0, "silent peer past the floor is reclaimed");
+        assert!(
+            out.pruned.contains(&NeighborId(1)),
+            "the pruned id is reported to the driver: {:?}",
+            out.pruned
+        );
+    }
+
+    #[test]
+    fn heard_neighbour_is_not_pruned() {
+        // A neighbour we keep hearing (heard refreshed every tick) keeps
+        // g_eff = d, never drops to the floor, and is never eligible.
+        let cfg = Config::default();
+        let mut a = Engine::new(RouterId::from("a"), px(1), cfg, Default::default());
+        a.add_neighbor(NeighborId(1));
+        let msg = Message {
+            from: RouterId::from("b"),
+            hears: vec![RouterId::from("a")],
+            delta: vec![Entry {
+                dest: RouterId::from("b"),
+                prefix: px(2),
+                pot: cfg.f0,
+                vit: 1.0,
+            }],
+        };
+        for k in 0..100u32 {
+            let now = cfg.tick * k;
+            a.ingest(now, NeighborId(1), &msg);
+            let out = a.step(now);
+            assert_eq!(a.neighbor_count(), 1, "heard peer survives at k={k}");
+            assert!(out.pruned.is_empty(), "nothing pruned at k={k}");
+        }
+    }
+
+    #[test]
+    fn pruned_neighbour_can_be_readmitted() {
+        // No permanent mute: a pruned source returning is re-admitted as a fresh
+        // neighbour and routes through it again.
+        let cfg = Config::default();
+        let mut a = Engine::new(RouterId::from("a"), px(1), cfg, Default::default());
+        a.add_neighbor(NeighborId(1));
+        let msg = Message {
+            from: RouterId::from("b"),
+            hears: vec![RouterId::from("a")],
+            delta: vec![Entry {
+                dest: RouterId::from("b"),
+                prefix: px(2),
+                pot: cfg.f0,
+                vit: 1.0,
+            }],
+        };
+        a.ingest(Duration::ZERO, NeighborId(1), &msg);
+        a.step(Duration::ZERO);
+        let out = a.step(cfg.tick * 60_000);
+        assert_eq!(a.neighbor_count(), 0, "peer pruned after long silence");
+        assert!(out.pruned.contains(&NeighborId(1)));
+
+        // The source returns: re-admit and drive the link bidirectional again.
+        let resume = cfg.tick * 60_000;
+        a.add_neighbor(NeighborId(1));
+        for k in 0..5u32 {
+            let now = resume + cfg.tick * k;
+            a.ingest(now, NeighborId(1), &msg);
+            a.step(now);
+        }
+        assert_eq!(a.neighbor_count(), 1, "neighbour is back after re-admission");
+        let route = a
+            .route(resume + cfg.tick * 5, &RouterId::from("b"))
+            .expect("b is interned again");
+        assert_eq!(route.via, Some(NeighborId(1)), "routes through it again");
+        assert!(route.routable, "and the route is live");
+    }
+
+    #[test]
+    fn no_link_age_never_prunes_neighbour() {
+        // Under the no_link_age ablation g_eff = g = d > floor always, so a peer
+        // is never prune-eligible (the ablation pins the relay).
+        let mut cfg = Config::default();
+        cfg.no_link_age = true;
+        let mut a = Engine::new(RouterId::from("a"), px(1), cfg, Default::default());
+        a.add_neighbor(NeighborId(1));
+        let msg = Message {
+            from: RouterId::from("b"),
+            hears: vec![RouterId::from("a")],
+            delta: vec![Entry {
+                dest: RouterId::from("b"),
+                prefix: px(2),
+                pot: cfg.f0,
+                vit: 1.0,
+            }],
+        };
+        a.ingest(Duration::ZERO, NeighborId(1), &msg);
+        a.step(Duration::ZERO);
+        // Same long-silence jump as the prune test — but nothing is eligible.
+        let out = a.step(cfg.tick * 60_000);
+        assert_eq!(a.neighbor_count(), 1, "no_link_age pins the relay forever");
+        assert!(out.pruned.is_empty(), "nothing pruned under no_link_age");
+    }
+
     #[test]
     fn charge_glides_toward_target_without_overshoot() {
         let mut cfg = Config::default();
