@@ -1,9 +1,8 @@
-use ring_core::Config;
-use ring_sim::Fabric;
+use ring_sim::{multihop_cfg, Fabric};
 
 #[test]
 fn clock_free_converges_and_severs_under_adversarial_skew() {
-    let cfg = Config::default();
+    let cfg = multihop_cfg();
     let skews = [-15i64, 11, -9, 14, -12]; // adversarial, dwarf the sub-tick transit
     let n = skews.len();
     let links: Vec<_> = (0..n - 1).map(|i| ring_sim::LinkSpec::clean(i, i + 1)).collect();

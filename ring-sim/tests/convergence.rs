@@ -1,9 +1,8 @@
-use ring_core::Config;
-use ring_sim::{Fabric, Outcome, Rng};
+use ring_sim::{multihop_cfg, Fabric, Outcome, Rng};
 
 #[test]
 fn line_converges_all_pairs_routable_and_delivering() {
-    let cfg = Config::default();
+    let cfg = multihop_cfg();
     let n = 6;
     let mut fab = Fabric::line(n, cfg, 7);
     fab.run_ticks(400); // STARTER budget; raise if needed
@@ -21,7 +20,7 @@ fn line_converges_all_pairs_routable_and_delivering() {
 
 #[test]
 fn grid_converges_corner_to_corner() {
-    let cfg = Config::default();
+    let cfg = multihop_cfg();
     let mut fab = Fabric::grid(3, 3, cfg, 7);
     fab.run_ticks(400);
     let mut rng = Rng::new(1);

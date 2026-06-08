@@ -2,7 +2,9 @@ use ring_core::{Config, NeighborId};
 use ring_sim::{Fabric, LinkSpec, Outcome, Rng};
 
 fn cfg_with_link_aging() -> Config {
-    Config::default()
+    // Wide-horizon operating point: the diamond's backup path is 3 hops, beyond the
+    // daemon default's aligned 2-hop reach. See ring_sim::multihop_cfg.
+    ring_sim::multihop_cfg()
 }
 
 fn cfg_frozen_link_ablation() -> Config {

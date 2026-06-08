@@ -1,11 +1,10 @@
 //! End-to-end harness behaviour: a converged line delivers; a dead hop black-holes then severs.
 
-use ring_core::Config;
-use ring_sim::{Fabric, Outcome, Rng};
+use ring_sim::{multihop_cfg, Fabric, Outcome, Rng};
 
 #[test]
 fn converged_line_delivers_stretch_one() {
-    let cfg = Config::default();
+    let cfg = multihop_cfg();
     let mut fab = Fabric::line(5, cfg, 7);
     fab.run_ticks(120); // generous for a 5-hop line to converge
     assert!(fab.is_routable(0, 4), "end-to-end route up");
@@ -18,7 +17,7 @@ fn converged_line_delivers_stretch_one() {
 
 #[test]
 fn dead_destination_blackholes_then_severs() {
-    let cfg = Config::default();
+    let cfg = multihop_cfg();
     let mut fab = Fabric::line(5, cfg, 7);
     fab.run_ticks(120);
     let mut rng = Rng::new(1);
@@ -39,7 +38,7 @@ fn dead_destination_blackholes_then_severs() {
 
 #[test]
 fn partitioned_destination_is_severed_not_blackholed() {
-    let cfg = Config::default();
+    let cfg = multihop_cfg();
     // two disconnected components: 0-1 and 2-3 (no link between them)
     let links = [
         ring_sim::LinkSpec::clean(0, 1),

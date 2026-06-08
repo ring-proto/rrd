@@ -11,10 +11,13 @@ use ring_sim::{Fabric, LinkSpec};
 /// peer's conductance ages out (`f` only drains as fast as the link conductance ages, which is far
 /// slower than vitality), so the drained+dead window opens without simulating ~10^6 ticks.
 fn gc_cfg() -> Config {
+    // Wide-horizon base (the 3-node line spans 2 hops, at the edge of the daemon
+    // default's aligned reach) with a small gc_dwell and a raised floor so f crosses
+    // below it within a tractable horizon. See ring_sim::multihop_cfg.
     Config {
         gc_dwell: 8.0,
         floor: 0.05,
-        ..Default::default()
+        ..ring_sim::multihop_cfg()
     }
 }
 

@@ -1,9 +1,8 @@
-use ring_core::Config;
-use ring_sim::Fabric;
+use ring_sim::{multihop_cfg, Fabric};
 
 #[test]
 fn dead_source_severs_everywhere() {
-    let cfg = Config::default();
+    let cfg = multihop_cfg();
     let n = 5;
     let mut fab = Fabric::line(n, cfg, 7);
     fab.run_ticks(300);
@@ -26,7 +25,7 @@ fn retardation_is_necessary_no_retard_fails_to_sever() {
     // (Thm 6.2). We assert the CONTRAST at a checkpoint where retarded has severed but no_retard
     // has not yet: retardation causes ~4x faster severance (measured: retarded severs ~25 ticks
     // post-kill; no_retard persists until ~70 ticks).
-    let mut cfg = Config::default();
+    let mut cfg = multihop_cfg();
     let n = 5;
     // Checkpoint tick budget: past the retarded severance horizon (~25t) but inside no_retard's
     // extended liveness window (~70t). 40 ticks is a comfortable midpoint.

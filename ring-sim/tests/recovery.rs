@@ -1,9 +1,8 @@
-use ring_core::Config;
-use ring_sim::Fabric;
+use ring_sim::{multihop_cfg, Fabric};
 
 #[test]
 fn node_failure_then_revive_recovers() {
-    let cfg = Config::default();
+    let cfg = multihop_cfg();
     let n = 5; // line 0-1-2-3-4; node 2 is a cut vertex between {0,1} and {3,4}
     let mut fab = Fabric::line(n, cfg, 7);
     fab.run_ticks(300);
@@ -18,7 +17,7 @@ fn node_failure_then_revive_recovers() {
 
 #[test]
 fn edge_cut_then_relink_recovers() {
-    let cfg = Config::default();
+    let cfg = multihop_cfg();
     let n = 5;
     let mut fab = Fabric::line(n, cfg, 7);
     fab.run_ticks(300);

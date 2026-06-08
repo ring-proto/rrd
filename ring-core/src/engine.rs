@@ -1302,9 +1302,10 @@ mod tests {
     fn silent_neighbour_is_pruned_after_aging_below_floor() {
         // A neighbour that goes silent forever must be reclaimed once its link
         // conductance has aged at or below `floor` (the Hears-echo horizon) and
-        // it backs no route. With defaults g_eff = age(α, d, k) ≤ floor needs
-        // k ≈ 44_718 ticks; a single jump of tick*60_000 past the base clears
-        // both that and the gc_dwell (live_at is only refreshed on steps/ingest).
+        // it backs no route. With the aligned defaults (α=0.1, d=1, floor=1e-4)
+        // g_eff = age(α, d, k) = 1/(1+αk) ≤ floor needs k ≈ 100_000 ticks; a single
+        // jump of tick*200_000 past the base clears both that and the gc_dwell
+        // (live_at is only refreshed on steps/ingest).
         let cfg = Config::default();
         // A non-zero base mirrors the daemon/sim clock base: a real `heard` is
         // never the ZERO sentinel (which means "never heard, do not prune").
@@ -1328,7 +1329,7 @@ mod tests {
         assert_eq!(a.neighbor_count(), 1, "fresh peer is retained");
 
         // Jump far past the floor horizon AND the dwell: the peer is pruned.
-        let out = a.step(base + cfg.tick * 60_000);
+        let out = a.step(base + cfg.tick * 200_000);
         assert_eq!(a.neighbor_count(), 0, "silent peer past the floor is reclaimed");
         assert!(
             out.pruned.contains(&NeighborId(1)),
@@ -1383,12 +1384,12 @@ mod tests {
         };
         a.ingest(base, NeighborId(1), &msg);
         a.step(base);
-        let out = a.step(base + cfg.tick * 60_000);
+        let out = a.step(base + cfg.tick * 200_000);
         assert_eq!(a.neighbor_count(), 0, "peer pruned after long silence");
         assert!(out.pruned.contains(&NeighborId(1)));
 
         // The source returns: re-admit and drive the link bidirectional again.
-        let resume = base + cfg.tick * 60_000;
+        let resume = base + cfg.tick * 200_000;
         a.add_neighbor(NeighborId(1));
         for k in 0..5u32 {
             let now = resume + cfg.tick * k;
@@ -1429,7 +1430,7 @@ mod tests {
         a.ingest(base, NeighborId(1), &msg);
         a.step(base);
         // Same long-silence jump as the prune test — but nothing is eligible.
-        let out = a.step(base + cfg.tick * 60_000);
+        let out = a.step(base + cfg.tick * 200_000);
         assert_eq!(a.neighbor_count(), 1, "no_link_age pins the relay forever");
         assert!(out.pruned.is_empty(), "nothing pruned under no_link_age");
     }
