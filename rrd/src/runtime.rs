@@ -398,7 +398,16 @@ impl<T: Transport> Daemon<T> {
                             };
                             self.fib_ops += stats.ops as u64;
                             self.fib_errors += stats.errors as u64;
-                            self.last_intents = intents;
+                            // Only memoise the desired set as "applied" when the
+                            // reconcile FULLY succeeded. If any op failed, leave
+                            // `last_intents` stale so the next tick re-attempts it
+                            // (the reconciler diffs against its own `installed`
+                            // map, so it retries only the failed ops). This keeps
+                            // the reconciler's idempotent "retry on next tick"
+                            // contract intact despite the dirty-check skip (#13).
+                            if stats.errors == 0 {
+                                self.last_intents = intents;
+                            }
                         }
                     }
 
