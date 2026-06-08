@@ -105,6 +105,7 @@ pub struct StatusReply {
     pub decode_errors: u64,
     pub fib_ops: u64,
     pub fib_errors: u64,
+    pub neighbors_pruned: u64,
 }
 
 /// Query the daemon's status over its control socket.
@@ -175,6 +176,7 @@ async fn handle_stream(
             "decode_errors": m.decode_errors_total,
             "fib_ops": m.fib_ops_total,
             "fib_errors": m.fib_errors_total,
+            "neighbors_pruned": m.neighbors_pruned_total,
             "routable": routable,
         });
         drop(snap);

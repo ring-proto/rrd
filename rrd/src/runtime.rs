@@ -50,6 +50,9 @@ pub struct Metrics {
     pub fib_ops_total: u64,
     /// Cumulative FIB operation failures.
     pub fib_errors_total: u64,
+    /// Cumulative neighbours reclaimed by the engine (silent past the
+    /// link-aging floor and backing no route), bounding the address maps.
+    pub neighbors_pruned_total: u64,
 }
 
 /// A snapshot of the RIB published each tick.
@@ -97,6 +100,8 @@ pub struct Daemon<T: Transport> {
     fib_ops: u64,
     /// Cumulative FIB operation failures.
     fib_errors: u64,
+    /// Cumulative neighbours reclaimed by the engine's prune pass.
+    neighbors_pruned: u64,
 }
 
 impl<T: Transport> Daemon<T> {
@@ -142,6 +147,7 @@ impl<T: Transport> Daemon<T> {
             decode_errors: 0,
             fib_ops: 0,
             fib_errors: 0,
+            neighbors_pruned: 0,
         };
         (daemon, rib_rx, local_origin_tx)
     }
@@ -290,6 +296,7 @@ impl<T: Transport> Daemon<T> {
             decode_errors_total: self.decode_errors,
             fib_ops_total: self.fib_ops,
             fib_errors_total: self.fib_errors,
+            neighbors_pruned_total: self.neighbors_pruned,
         };
         RibSnapshot { routable, metrics }
     }
@@ -333,6 +340,17 @@ impl<T: Transport> Daemon<T> {
                     if let Err(e) = self.transport.send(&encoded).await {
                         tracing::warn!("transport send error (all interfaces failed): {}", e);
                     }
+                    // Reclaim address mappings for neighbours the engine pruned
+                    // (silent past the link-aging horizon), bounding the
+                    // (iface,src)->id maps under churn/spoofing. A returning
+                    // source is then re-admitted as a fresh neighbour.
+                    for nid in &out.pruned {
+                        if let Some(addr) = self.addr_by_neighbor.remove(nid) {
+                            self.neighbor_by_addr.remove(&addr);
+                        }
+                        tracing::debug!(?nid, "neighbour pruned (silent past link-aging horizon)");
+                    }
+                    self.neighbors_pruned += out.pruned.len() as u64;
                     // FIB reconcile after each tick. Build the intents first (an
                     // immutable borrow of `self`), then take the `&mut self.fib`
                     // borrow only inside the block so it ends before we update the
@@ -365,6 +383,7 @@ impl<T: Transport> Daemon<T> {
                             decode_errors_interval = m.decode_errors_total.saturating_sub(prev_decode),
                             fib_ops = m.fib_ops_total,
                             fib_errors = m.fib_errors_total,
+                            neighbors_pruned = m.neighbors_pruned_total,
                             "rrd status"
                         );
                         prev_rx = m.datagrams_rx_total;
