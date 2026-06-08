@@ -1,0 +1,115 @@
+# Tuning rrd: reach, horizon alignment, and convergence speed
+
+`rrd` routes on two scalar fields per destination:
+
+- a **routing potential** `f` — a screened-Poisson (M-matrix) field that points up-gradient
+  toward the source; loop- and black-hole-free by the maximum principle.
+- a **vitality** `V` — a retarded eikonal liveness field, `V = 1/(1 + α·h)` over `h` hops from a
+  live source, that decays as evidence goes stale.
+
+Two parameters set the two horizons:
+
+| Quantity | Formula | Meaning |
+|---|---|---|
+| Reach `λ` | `√(D/κ)` | the screening length of `f` — how far the potential carries |
+| Vitality horizon `R_V` | `(1/φ − 1)/α` | hop distance at which a live source's `V` falls to `φ` |
+
+`D` is the bulk per-link conductance (default `1`), `κ` the screening coefficient, `α` the
+proper-time aging rate (it ages **both** vitality and, as series resistance, stale link
+conductance — one operator, `β = α`), and `φ` the vitality action threshold.
+
+A destination is **routable** when `f ≥ floor` (reachable) **and** `V ≥ φ` (live). Because
+`V = 1/(1+α·h)`, liveness holds for `h < R_V` — so the **reliable reach is just under `R_V`
+hops**. (At exactly `R_V` hops `V = φ`, and read-time aging tips it under: don't size a network
+to its `R_V` exactly — leave a hop of margin.)
+
+## Horizon alignment (the default)
+
+The default config is **horizon-aligned**: `R_V = λ` (`R_V/λ = 1`). With `β = α` this makes the
+two fields forget stale evidence on the *same* scale, so
+
+```
+f < floor  ⟺  V < φ
+```
+
+i.e. a destination's reachability and its liveness expire together. Reach-ball GC and severance
+are then **prompt and non-churning** — there is no window where `f` lingers above the floor while
+`V` has already died (or vice-versa), so nothing is reaped while still advertised and nothing
+advertised lingers after death.
+
+At `φ = 0.5` the alignment condition `R_V = λ` reduces to the clean relation
+
+```
+α = √(κ/D) = 1/λ
+```
+
+The shipped default picks `λ = R_V = 10` (reliable reach ≈ 9 hops):
+
+```
+D = 1,  κ = 0.01,  α = 0.1,  φ = 0.5   ⟹   λ = R_V = 10
+```
+
+> The Go reference's sim/paper *proving ground* deliberately uses an **un-aligned** `R_V ≈ 4λ`
+> (`κ=0.05, α=0.224, φ=0.2`) so long-path phenomena stay visible across many hops. That is a
+> demonstration tuning, **not** the daemon's — a daemon wants alignment.
+
+## Scaling reach to your diameter
+
+To keep the alignment while reaching a network of diameter `N` hops, pick (at `φ = 0.5`):
+
+```
+κ = D / N²        α = √(κ/D) = 1/N        φ = 0.5
+```
+
+and pass them at launch:
+
+```
+rrd --prefix … --iface … --kappa <κ> --alpha <α> --phi 0.5
+```
+
+| Target reach `N` | `κ` | `α` | reliable hops |
+|---|---|---|---|
+| 4  | 0.0625  | 0.25  | ~3  |
+| 8  | 0.0156  | 0.125 | ~7  |
+| **10 (default)** | **0.01** | **0.1** | **~9** |
+| 16 | 0.0039  | 0.0625 | ~15 |
+| 20 | 0.0025  | 0.05  | ~19 |
+
+(Leave a hop of margin: to *reliably* route `M` hops choose `N ≥ M + 1`.)
+
+## The reach ↔ convergence-speed trade-off
+
+The screened-Poisson relaxation that solves `f` converges at a rate that scales with `κ`
+(larger `κ` ⇒ more diagonally dominant ⇒ faster contraction). So:
+
+- **Small `κ` (long reach)** converges **slowly**. Healing a cut on a multi-hop path can take
+  *seconds to tens of seconds* to fully reconverge at the default `κ = 0.01`, with high variance
+  (the async relaxation schedule plus the ~1 s multicast re-join after a link flap). The
+  `harness/multihop.sh` validation uses a generous, poll-based heal window for exactly this
+  reason — correctness is unaffected, only the pace.
+- **Large `κ` (short reach)** converges **fast**.
+
+Choose by what your deployment values:
+
+- **Reach over speed** (large diameter, failover latency tolerable): keep `κ` small (the default).
+- **Speed over reach** (small diameter, fast failover required): raise `κ` (shorter `λ`/`R_V`),
+  re-deriving the aligned `α = √(κ/D)`. E.g. a 4-hop network with fast failover: `κ = 0.0625,
+  α = 0.25, φ = 0.5` (`λ = R_V = 4`) converges markedly faster than the default.
+
+There is no setting that is both maximally long-reaching and maximally fast — it is the physics of
+the field, not an implementation limit.
+
+## Other knobs
+
+- `--max-paths N` — install up to `N` weighted ECMP next-hops per destination (the engine always
+  computes the full weighted uphill set; this caps how much reaches the FIB). Default 8.
+- `--max-dests N` — hard cap on interned destinations (untrusted-intern memory bound). Default 65536.
+- `--gc-dwell T` — ticks a drained, dead, non-origin slot must dwell before reach-ball GC evicts it.
+- `--tick-ms` — emission period / proper-time quantum. `α` is cadence-invariant *per tick*, so the
+  wall-clock horizon scales with the tick; the hop-count horizons above are tick-independent.
+
+## Validating a configuration
+
+- `make demo` — 2-hop milestone (real packets, cut/heal) at the default.
+- `make multihop` — multi-hop (default 4-hop) real-packet routing + cut/heal at the default;
+  `NODES=7 bash harness/multihop.sh` for longer lines, `HEAL_WAIT=…` to widen the reconverge window.
