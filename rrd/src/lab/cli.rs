@@ -272,8 +272,8 @@ fn print_help() {
          \x20 diamond | line:N | mesh:N | fat-tree:K | grid:WxH\n\
          \n\
          LIVE TUI KEYS:\n\
-         \x20 j/k move   t start/stop traffic   : command   q quit\n\
-         \x20 commands: cut <A> <B> | heal <A> <B> | stop <node> | start <node>\n\
+         \x20 j/k move   t start/stop traffic   c arm/cut/heal   : command   q quit\n\
+         \x20 commands: cut <A> <B> | heal <A> <B> | traffic <A> <B> <flows>\n\
          \x20 The fabric comes up immediately — watch routes climb, cut a link\n\
          \x20 and watch per-leg traffic shift live (no convergence wait).\n\
          \n\

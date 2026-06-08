@@ -31,6 +31,9 @@ pub struct App {
     /// Effects the loop must forward to the live engine. Drained each frame.
     /// In dry-run mode this stays empty (intents are applied to the model only).
     pub pending: Vec<Effect>,
+    /// Ringscope-style cut verb: first endpoint selected by pressing `c`; press
+    /// `c` on a neighbour to cut/heal that segment, or same node to cancel.
+    pub cut_arm: Option<String>,
 }
 
 /// A side effect the pure reducer wants the loop to perform against the live
@@ -59,6 +62,7 @@ impl App {
             live: false,
             default_flows: 8,
             pending: Vec::new(),
+            cut_arm: None,
         }
     }
 
@@ -96,6 +100,8 @@ pub enum AppEvent {
     Refresh,
     /// Toggle continuous traffic (live mode): start first→last node, or stop.
     ToggleTraffic,
+    /// Ringscope-style cut/relink verb: arm selected node or cut/heal to it.
+    ToggleCut,
     /// Request quit.
     Quit,
 }
@@ -126,6 +132,7 @@ fn reduce_normal(app: &mut App, event: AppEvent) {
             }
         }
         AppEvent::ToggleTraffic => toggle_traffic(app),
+        AppEvent::ToggleCut => toggle_cut(app),
         // In normal mode, typed characters and command-only events are ignored.
         AppEvent::Char(_) | AppEvent::Backspace | AppEvent::Submit | AppEvent::CancelCommand => {}
     }
@@ -155,6 +162,56 @@ fn toggle_traffic(app: &mut App) {
     app.lab
         .log(format!("starting traffic {from} -> {to} x{flows}"));
     app.pending.push(Effect::StartTraffic { from, to, flows });
+}
+
+/// Ringscope-style cut/relink workflow. Press `c` once to arm the selected
+/// node; move to a neighbour and press `c` again to cut an up segment or heal a
+/// down segment. Same-node second press cancels. In live mode this queues an
+/// engine effect; in dry-run mode it only mutates the pure model.
+fn toggle_cut(app: &mut App) {
+    let Some(current) = app.lab.selected_node_name().map(|s| s.to_string()) else {
+        app.lab.log("cut: no selected node");
+        return;
+    };
+    let Some(armed) = app.cut_arm.clone() else {
+        app.cut_arm = Some(current.clone());
+        app.lab.log(format!("CUT ARMED at {current}"));
+        return;
+    };
+    if armed == current {
+        app.cut_arm = None;
+        app.lab.log(format!("CUT canceled at {current}"));
+        return;
+    }
+    let Some(seg) = app
+        .lab
+        .segment_between(&armed, &current)
+        .map(|s| s.to_string())
+    else {
+        app.lab
+            .log(format!("cut: no segment between {armed} and {current}"));
+        app.cut_arm = None;
+        return;
+    };
+    let was_up = app
+        .lab
+        .segments
+        .iter()
+        .find(|s| s.name == seg)
+        .map(|s| s.up)
+        .unwrap_or(true);
+    if was_up {
+        app.lab.cut_segment(&seg);
+        if app.live {
+            app.pending.push(Effect::Cut(seg));
+        }
+    } else {
+        app.lab.heal_segment(&seg);
+        if app.live {
+            app.pending.push(Effect::Heal(seg));
+        }
+    }
+    app.cut_arm = None;
 }
 
 /// Apply a parsed command in LIVE mode: queue the corresponding engine effect
@@ -257,6 +314,7 @@ fn reduce_command(app: &mut App, event: AppEvent) {
         | AppEvent::SelectPrev
         | AppEvent::EnterCommand
         | AppEvent::ToggleTraffic
+        | AppEvent::ToggleCut
         | AppEvent::Refresh => {}
     }
 }
@@ -305,6 +363,7 @@ mod loop_impl {
                 KeyCode::Char(':') => Some(AppEvent::EnterCommand),
                 KeyCode::Char('r') => Some(AppEvent::Refresh),
                 KeyCode::Char('t') => Some(AppEvent::ToggleTraffic),
+                KeyCode::Char('c') => Some(AppEvent::ToggleCut),
                 _ => None,
             },
             Mode::Command => match code {
@@ -596,5 +655,54 @@ mod tests {
         }
         reduce(&mut app, AppEvent::Backspace);
         assert_eq!(app.command_buffer, "quit");
+    }
+
+    #[test]
+    fn c_arms_selected_node_for_cut() {
+        let mut app = app_line3();
+        assert_eq!(app.lab.selected_node_name(), Some("ring0"));
+        reduce(&mut app, AppEvent::ToggleCut);
+        assert_eq!(app.cut_arm.as_deref(), Some("ring0"));
+        assert!(app
+            .lab
+            .events
+            .iter()
+            .any(|e| e.message.contains("CUT ARMED")));
+    }
+
+    #[test]
+    fn c_on_neighbour_cuts_armed_link_and_disarms() {
+        let mut app = app_line3().live();
+        reduce(&mut app, AppEvent::ToggleCut); // arm ring0
+        reduce(&mut app, AppEvent::SelectNext); // ring1
+        reduce(&mut app, AppEvent::ToggleCut);
+        assert_eq!(app.cut_arm, None);
+        assert!(
+            !app.lab
+                .segments
+                .iter()
+                .find(|s| s.name == "ring0-ring1")
+                .unwrap()
+                .up
+        );
+        assert_eq!(app.pending, vec![Effect::Cut("ring0-ring1".into())]);
+    }
+
+    #[test]
+    fn c_on_cut_neighbour_heals_link() {
+        let mut app = app_line3().live();
+        app.lab.cut_segment("ring0-ring1");
+        reduce(&mut app, AppEvent::ToggleCut); // arm ring0
+        reduce(&mut app, AppEvent::SelectNext); // ring1
+        reduce(&mut app, AppEvent::ToggleCut);
+        assert!(
+            app.lab
+                .segments
+                .iter()
+                .find(|s| s.name == "ring0-ring1")
+                .unwrap()
+                .up
+        );
+        assert_eq!(app.pending, vec![Effect::Heal("ring0-ring1".into())]);
     }
 }
