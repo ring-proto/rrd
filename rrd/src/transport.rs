@@ -38,9 +38,12 @@ pub trait Transport: Send + Sync + 'static {
 const MEM_PORT: u16 = 6699;
 
 /// A queued datagram in the in-process bus.
+///
+/// Note there is no `src_iface`: the inbound `iface` is stamped by the RECEIVER (its own
+/// ifindex), mirroring the UDP transport (#28). The sender's interface identity, where it
+/// matters, already travels in `src`'s scope id.
 struct MemDatagram {
     src: SocketAddrV6,
-    src_iface: u32,
     data: Vec<u8>,
 }
 
@@ -111,8 +114,14 @@ pub struct MemTransport {
 impl Transport for MemTransport {
     async fn recv(&mut self) -> std::io::Result<Inbound> {
         match self.rx.recv().await {
+            // Stamp the RECEIVER's ifindex, matching the UDP transport (#28): `Udp6Transport`'s
+            // reader task tags every inbound datagram with the ifindex of the socket it arrived on,
+            // NOT the sender's. The runtime keys neighbours by (inbound iface, src) and projects the
+            // FIB output interface from that iface, so a multi-iface in-memory topology must honour
+            // the same contract or it would resolve the wrong output interface. Each MemTransport has
+            // a single synthetic ifindex (`self.iface`), which is the receiving interface here.
             Some(dg) => Ok(Inbound {
-                iface: dg.src_iface,
+                iface: self.iface,
                 src: dg.src,
                 data: dg.data,
             }),
@@ -124,19 +133,13 @@ impl Transport for MemTransport {
     }
 
     async fn send(&self, data: &[u8]) -> std::io::Result<()> {
-        let dg = MemDatagram {
-            src: self.src,
-            src_iface: self.iface,
-            data: data.to_vec(),
-        };
         // Fan out to all peers. If a peer's receiver is gone we ignore the error
         // (same semantics as UDP on a network where some nodes have left).
         for peer in &self.peers {
             // Each peer needs its own copy since mpsc sends by value.
             let _ = peer.send(MemDatagram {
-                src: dg.src,
-                src_iface: dg.src_iface,
-                data: dg.data.clone(),
+                src: self.src,
+                data: data.to_vec(),
             });
         }
         Ok(())
@@ -186,8 +189,11 @@ mod tests {
         assert!(decoded.hears.is_empty());
         assert!(decoded.delta.is_empty());
 
-        // Verify metadata: iface should be node0's synthetic ifindex (1).
-        assert_eq!(inbound.iface, 1);
+        // Verify metadata: iface is the RECEIVER's synthetic ifindex (#28). node1 received it, so
+        // its own ifindex is 2 — matching the UDP transport, which tags inbound with the socket
+        // the datagram arrived on, not the sender's interface. (Before the #28 fix this asserted 1,
+        // the sender's ifindex, baking in the wrong receiver-iface contract.)
+        assert_eq!(inbound.iface, 2);
         // src should be node0's synthetic fe80::0 address.
         assert_eq!(
             inbound.src.ip(),
