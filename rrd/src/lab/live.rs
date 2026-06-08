@@ -96,13 +96,26 @@ pub async fn run_live(opts: LiveOptions) -> anyhow::Result<()> {
     );
     tokio::time::sleep(Duration::from_secs(opts.converge_secs)).await;
 
-    // Show the source node's installed RING routes.
+    // Show the source node's installed RING routes, and capture the route to
+    // the destination prefix so we can report its ACTUAL path diversity (the
+    // number of ECMP next-hops the field installed) — the honest multipath
+    // signal, distinct from how many sequential transit legs see packets.
     println!("\n-- {from}: installed RING routes (proto 155) --");
-    match be.routes(&from).await {
-        Ok(r) if !r.trim().is_empty() => println!("{}", r.trim()),
-        Ok(_) => println!("(no routes yet)"),
-        Err(e) => println!("(routes error: {e})"),
+    let routes_text = be.routes(&from).await.unwrap_or_default();
+    if routes_text.trim().is_empty() {
+        println!("(no routes yet)");
+    } else {
+        println!("{}", routes_text.trim());
     }
+    let dst_prefix = topo
+        .nodes
+        .iter()
+        .find(|n| n.name == to)
+        .map(|n| n.prefix.clone());
+    let nexthops = dst_prefix
+        .as_deref()
+        .map(|pfx| count_route_nexthops(&routes_text, pfx))
+        .unwrap_or(0);
 
     // Determine the transit relays to watch: every node that is neither source
     // nor destination contributes its outgoing legs. For the report we list all
@@ -140,14 +153,18 @@ pub async fn run_live(opts: LiveOptions) -> anyhow::Result<()> {
         println!("  {:<18} {:>5}  {}", leg, n, bar);
     }
     let active = legs.iter().filter(|(_, v)| **v > 0).count();
+    println!("\n{active} of {} transit legs carried traffic.", legs.len());
+    // The honest multipath verdict keys off the route's installed next-hop count
+    // (parallel paths the field actually offered), NOT the raw active-leg count
+    // — on a line every hop is a transit leg but there is only ONE path.
     println!(
-        "\n{} of {} transit legs carried traffic — load {}",
-        active,
-        legs.len(),
-        if active >= 2 {
-            "SPREAD across multiple paths"
+        "route {} -> {}: {nexthops} installed next-hop(s) — {}",
+        from,
+        to,
+        if nexthops >= 2 {
+            "MULTIPATH: the field split traffic across parallel paths"
         } else {
-            "on a single path"
+            "single path"
         }
     );
 
@@ -161,4 +178,72 @@ fn rrd_bin() -> std::path::PathBuf {
     std::env::var("RRD_BIN")
         .map(std::path::PathBuf::from)
         .unwrap_or_else(|_| std::env::current_exe().unwrap_or_else(|_| "rrd".into()))
+}
+
+/// Count the installed next-hops for `prefix` in an `ip -6 route show` dump.
+///
+/// `ip` prints a single-path route with the gateway inline (no `nexthop`
+/// keyword → 1 hop) and a multipath route as a header line followed by one
+/// `nexthop ...` line per leg. Mirrors the harness's `route_nexthops`.
+fn count_route_nexthops(routes_text: &str, prefix: &str) -> usize {
+    // Find the route block beginning at the line that starts with the prefix.
+    let mut lines = routes_text.lines().peekable();
+    while let Some(line) = lines.next() {
+        if line.trim_start().starts_with(prefix) {
+            // Collect this line plus following indented `nexthop` continuation
+            // lines (multipath routes wrap onto tab-indented lines).
+            let mut nh = line.matches("nexthop").count();
+            while let Some(next) = lines.peek() {
+                let t = next.trim_start();
+                if t.starts_with("nexthop") {
+                    nh += 1;
+                    lines.next();
+                } else if next.starts_with(char::is_whitespace) {
+                    // continuation of the same route (e.g. wrapped attributes)
+                    lines.next();
+                } else {
+                    break;
+                }
+            }
+            // Inline single-gateway route has 0 "nexthop" keywords → 1 path.
+            return if nh == 0 { 1 } else { nh };
+        }
+    }
+    0
+}
+
+#[cfg(test)]
+mod tests {
+    use super::count_route_nexthops;
+
+    #[test]
+    fn counts_single_inline_gateway_as_one() {
+        let dump = "fd00:a1::/64 via fe80::1 dev v0_0 metric 1024 pref medium";
+        assert_eq!(count_route_nexthops(dump, "fd00:a1::/64"), 1);
+    }
+
+    #[test]
+    fn counts_multipath_nexthops() {
+        let dump = "fd00:a3::/64 metric 1024 pref medium\n\
+                    \tnexthop via fe80::1 dev v0_0 weight 256 \n\
+                    \tnexthop via fe80::2 dev v1_0 weight 236";
+        assert_eq!(count_route_nexthops(dump, "fd00:a3::/64"), 2);
+    }
+
+    #[test]
+    fn missing_prefix_is_zero() {
+        let dump = "fd00:a1::/64 via fe80::1 dev v0_0";
+        assert_eq!(count_route_nexthops(dump, "fd00:ff::/64"), 0);
+    }
+
+    #[test]
+    fn picks_the_right_block_among_many() {
+        let dump = "fd00:a1::/64 via fe80::1 dev v0_0 metric 1024 pref medium\n\
+                    fd00:a2::/64 via fe80::1 dev v1_0 metric 1024 pref medium\n\
+                    fd00:a3::/64 metric 1024 pref medium\n\
+                    \tnexthop via fe80::1 dev v0_0 weight 256 \n\
+                    \tnexthop via fe80::2 dev v1_0 weight 236";
+        assert_eq!(count_route_nexthops(dump, "fd00:a1::/64"), 1);
+        assert_eq!(count_route_nexthops(dump, "fd00:a3::/64"), 2);
+    }
 }
