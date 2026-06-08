@@ -30,12 +30,39 @@ fn base_offset(tick: Mono) -> Mono {
     tick * 1000
 }
 
+/// Operational metrics, published alongside the RIB each tick. Gauges are the
+/// current value; the `*_total` fields are cumulative counters over the daemon's
+/// life.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Metrics {
+    /// Destinations the engine currently tracks (`engine.dest_count()`).
+    pub dests: usize,
+    /// Neighbours discovered on the wire.
+    pub neighbors: usize,
+    /// Routes currently installed in the kernel FIB; with `--no-fib`, the number
+    /// of routable destinations that *would* be installed.
+    pub routes: usize,
+    /// Cumulative datagrams handed to the daemon (decoded or not).
+    pub datagrams_rx_total: u64,
+    /// Cumulative wire-decode failures.
+    pub decode_errors_total: u64,
+    /// Cumulative FIB operations applied (install + withdraw).
+    pub fib_ops_total: u64,
+    /// Cumulative FIB operation failures.
+    pub fib_errors_total: u64,
+}
+
 /// A snapshot of the RIB published each tick.
 #[derive(Clone, Debug, Default)]
 pub struct RibSnapshot {
     /// Destinations currently routable: `(router-id, their announced prefix)`.
     pub routable: Vec<(RouterId, Prefix)>,
+    /// Operational metrics captured at the same instant as `routable`.
+    pub metrics: Metrics,
 }
+
+/// Wall-clock period between periodic structured status log lines.
+const STATUS_LOG_PERIOD: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// Runtime command for destinations dynamically originated by this node.
 #[derive(Clone, Debug)]
@@ -62,6 +89,14 @@ pub struct Daemon<T: Transport> {
     fib: Option<FibReconciler>,
     local_origin_rx: mpsc::UnboundedReceiver<LocalOriginCommand>,
     local_origin_closed: bool,
+    /// Cumulative datagrams handed to the daemon (decoded or not).
+    datagrams_rx: u64,
+    /// Cumulative wire-decode failures.
+    decode_errors: u64,
+    /// Cumulative FIB operations applied (install + withdraw).
+    fib_ops: u64,
+    /// Cumulative FIB operation failures.
+    fib_errors: u64,
 }
 
 impl<T: Transport> Daemon<T> {
@@ -103,6 +138,10 @@ impl<T: Transport> Daemon<T> {
             fib: None,
             local_origin_rx,
             local_origin_closed: false,
+            datagrams_rx: 0,
+            decode_errors: 0,
+            fib_ops: 0,
+            fib_errors: 0,
         };
         (daemon, rib_rx, local_origin_tx)
     }
@@ -129,6 +168,7 @@ impl<T: Transport> Daemon<T> {
 
     /// Handle a decoded inbound datagram.
     fn handle_inbound(&mut self, inb: Inbound) {
+        self.datagrams_rx += 1;
         match wire::decode(&inb.data) {
             Ok(msg) => {
                 let src_ip = *inb.src.ip();
@@ -150,6 +190,7 @@ impl<T: Transport> Daemon<T> {
                 self.engine.ingest(now, nid, &msg);
             }
             Err(e) => {
+                self.decode_errors += 1;
                 tracing::debug!("wire decode error: {}", e);
             }
         }
@@ -237,7 +278,20 @@ impl<T: Transport> Daemon<T> {
             })
             .collect();
         tracing::debug!("RIB snapshot: {} routable dests", routable.len());
-        RibSnapshot { routable }
+        let routes = match &self.fib {
+            Some(fib) => fib.installed_count(),
+            None => routable.len(),
+        };
+        let metrics = Metrics {
+            dests: self.engine.dest_count(),
+            neighbors: self.neighbor_by_addr.len(),
+            routes,
+            datagrams_rx_total: self.datagrams_rx,
+            decode_errors_total: self.decode_errors,
+            fib_ops_total: self.fib_ops,
+            fib_errors_total: self.fib_errors,
+        };
+        RibSnapshot { routable, metrics }
     }
 
     /// Run the daemon until `shutdown` resolves.
@@ -265,6 +319,11 @@ impl<T: Transport> Daemon<T> {
         // Avoid tick bursting after a long sleep.
         interval.set_missed_tick_behavior(time::MissedTickBehavior::Skip);
 
+        // Periodic status-log bookkeeping.
+        let mut last_status = self.start.elapsed();
+        let mut prev_rx: u64 = 0;
+        let mut prev_decode: u64 = 0;
+
         loop {
             tokio::select! {
                 _ = interval.tick() => {
@@ -274,14 +333,42 @@ impl<T: Transport> Daemon<T> {
                     if let Err(e) = self.transport.send(&encoded).await {
                         tracing::warn!("transport send error (all interfaces failed): {}", e);
                     }
-                    let snap = self.build_snapshot();
-                    let _ = self.rib_tx.send(snap);
-                    // FIB reconcile after each tick.
+                    // FIB reconcile after each tick. Capture the per-pass stats into
+                    // a local so the `&mut self.fib` borrow ends before we update the
+                    // cumulative counters on `self`.
                     if self.fib.is_some() {
                         let intents = self.build_route_intents();
-                        if let Some(fib) = &mut self.fib {
-                            fib.reconcile(&intents).await;
-                        }
+                        let stats = {
+                            let fib = self.fib.as_mut().unwrap();
+                            fib.reconcile(&intents).await
+                        };
+                        self.fib_ops += stats.ops as u64;
+                        self.fib_errors += stats.errors as u64;
+                    }
+                    // Build the snapshot once (after reconcile, so `routes` reflects
+                    // this tick's installs) and reuse it for both the watch publish
+                    // and the periodic status log.
+                    let snap = self.build_snapshot();
+                    let _ = self.rib_tx.send(snap.clone());
+
+                    let elapsed = self.start.elapsed();
+                    if elapsed.saturating_sub(last_status) >= STATUS_LOG_PERIOD {
+                        let m = &snap.metrics;
+                        tracing::info!(
+                            dests = m.dests,
+                            neighbors = m.neighbors,
+                            routes = m.routes,
+                            datagrams_rx = m.datagrams_rx_total,
+                            rx_interval = m.datagrams_rx_total.saturating_sub(prev_rx),
+                            decode_errors = m.decode_errors_total,
+                            decode_errors_interval = m.decode_errors_total.saturating_sub(prev_decode),
+                            fib_ops = m.fib_ops_total,
+                            fib_errors = m.fib_errors_total,
+                            "rrd status"
+                        );
+                        prev_rx = m.datagrams_rx_total;
+                        prev_decode = m.decode_errors_total;
+                        last_status = elapsed;
                     }
                 }
                 result = self.transport.recv() => {
@@ -350,5 +437,37 @@ mod tests {
         // The initial snapshot is the default empty one.
         let snap = rx.borrow();
         assert!(snap.routable.is_empty());
+    }
+
+    #[tokio::test]
+    async fn metrics_count_datagrams_and_decode_errors() {
+        use crate::transport::Inbound;
+        use std::net::SocketAddrV6;
+
+        let mut transports = MemBus::fully_connected(1);
+        let t = transports.remove(0);
+        let cfg = make_config("n0", "fd00::1".parse().unwrap(), 100);
+        let (mut daemon, _rx) = Daemon::new(cfg, t);
+
+        // A fresh daemon reports all-zero counters.
+        let fresh = daemon.build_snapshot();
+        assert_eq!(fresh.metrics.datagrams_rx_total, 0);
+        assert_eq!(fresh.metrics.decode_errors_total, 0);
+        assert_eq!(fresh.metrics.fib_ops_total, 0);
+        assert_eq!(fresh.metrics.fib_errors_total, 0);
+
+        // Feed a single garbage datagram: it is counted as received, and the
+        // wire decode fails, so it is also counted as a decode error.
+        let src = SocketAddrV6::new("fe80::1".parse().unwrap(), 6699, 0, 1);
+        let inb = Inbound {
+            iface: 1,
+            src,
+            data: vec![0xff; 4],
+        };
+        daemon.handle_inbound(inb);
+
+        let snap = daemon.build_snapshot();
+        assert_eq!(snap.metrics.datagrams_rx_total, 1);
+        assert_eq!(snap.metrics.decode_errors_total, 1);
     }
 }

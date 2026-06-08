@@ -78,6 +78,15 @@ pub fn ecmp_weights(weights: &[f64]) -> Vec<u8> {
         .collect()
 }
 
+/// Outcome of a single `reconcile` pass.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ReconcileStats {
+    /// Kernel mutations applied this pass (installs + withdraws).
+    pub ops: u32,
+    /// Operations that failed (logged at warn, retried next tick).
+    pub errors: u32,
+}
+
 /// Maintains a diff between the desired set of routes and what is currently
 /// installed in the kernel, applying the minimal set of rtnetlink operations.
 pub struct FibReconciler {
@@ -104,7 +113,8 @@ impl FibReconciler {
     /// - New or changed prefixes → add/replace.
     /// - Prefixes no longer desired → delete.
     /// - Errors → log warn, retry next tick.
-    pub async fn reconcile(&mut self, desired: &[RouteIntent]) {
+    pub async fn reconcile(&mut self, desired: &[RouteIntent]) -> ReconcileStats {
+        let mut stats = ReconcileStats::default();
         // Index desired by prefix.
         let desired_map: HashMap<Prefix, &RouteIntent> =
             desired.iter().map(|r| (r.prefix, r)).collect();
@@ -125,8 +135,10 @@ impl FibReconciler {
                 match self.install_route(intent).await {
                     Ok(()) => {
                         self.installed.insert(prefix, intent.clone());
+                        stats.ops += 1;
                     }
                     Err(e) => {
+                        stats.errors += 1;
                         tracing::warn!(
                             "fib: failed to install {}/{}: {}",
                             prefix.addr,
@@ -150,15 +162,18 @@ impl FibReconciler {
             match self.delete_route(&prefix).await {
                 Ok(()) => {
                     self.installed.remove(&prefix);
+                    stats.ops += 1;
                 }
                 Err(e) if is_already_gone(&e) => {
                     // The kernel already removed this route (e.g. its link went
                     // down and the route was flushed).  The desired state — route
                     // absent — is satisfied, so drop our bookkeeping instead of
-                    // retrying the delete forever.
+                    // retrying the delete forever.  This is convergence, not a
+                    // kernel mutation, so it counts as neither an op nor an error.
                     self.installed.remove(&prefix);
                 }
                 Err(e) => {
+                    stats.errors += 1;
                     tracing::warn!(
                         "fib: failed to withdraw {}/{}: {}",
                         prefix.addr,
@@ -168,6 +183,12 @@ impl FibReconciler {
                 }
             }
         }
+        stats
+    }
+
+    /// Number of routes currently installed in the kernel (our bookkeeping).
+    pub fn installed_count(&self) -> usize {
+        self.installed.len()
     }
 
     /// Delete all installed routes (graceful shutdown).
