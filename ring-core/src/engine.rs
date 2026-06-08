@@ -234,17 +234,24 @@ impl Engine {
         self.load
     }
 
+    /// Vitality toward slot `d`, aged to `now` from the last shared aging instant (`last_aged`).
+    /// The single definition of the read-time aging law, shared by the data-plane read ([`route`])
+    /// and the FIB view ([`desired_routes`]) so the two cannot drift apart.
+    fn aged_vit(&self, d: usize, now: Mono) -> f64 {
+        age(
+            self.cfg.alpha,
+            self.vit[d],
+            ticks_between(self.last_aged, now, self.cfg.tick),
+        )
+    }
+
     /// The data-plane read: dominant next-hop, vitality aged to `now`, and the routability gate
     /// `known ∧ V ≥ φ`, where `known = f ≥ floor ∧ via defined`. Returns `None` only when `dest`
     /// has never been interned (never heard of); a known-but-degraded destination returns
     /// `Some` with `routable = false` and the direction still populated.
     pub fn route(&self, now: Mono, dest: &RouterId) -> Option<Route> {
         let &d = self.dest_slot.get(dest)?;
-        let v = age(
-            self.cfg.alpha,
-            self.vit[d],
-            ticks_between(self.last_aged, now, self.cfg.tick),
-        );
+        let v = self.aged_vit(d, now);
         let known = self.f[d] >= self.cfg.floor && self.dominant[d].is_some();
         Some(Route {
             via: self.dominant[d],
@@ -506,7 +513,6 @@ impl Engine {
     /// full by `step`; the policy decides how much to install), and `routable = known ∧ V ≥ φ` with
     /// `V` aged to `now`. `known = f ≥ floor ∧ via defined`; unknown destinations are skipped.
     pub fn desired_routes(&self, now: Mono) -> impl Iterator<Item = DesiredRoute> + '_ {
-        let drift = ticks_between(self.last_aged, now, self.cfg.tick);
         (0..self.ndest()).filter_map(move |d| {
             if self.local_origins.contains_key(&self.dest_key[d]) {
                 return None;
@@ -515,7 +521,7 @@ impl Engine {
             if !known {
                 return None;
             }
-            let v = age(self.cfg.alpha, self.vit[d], drift);
+            let v = self.aged_vit(d, now);
             let nexthops: SmallVec<[WeightedHop; 4]> = self.hops[d]
                 .iter()
                 .take(self.policy.max_paths.max(1))

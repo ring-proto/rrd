@@ -61,8 +61,8 @@ at the bottom for suggested work order.
 
 ## ⚪ Nits / deferred
 
-- [ ] **32. `route()` and `desired_routes()` duplicate the vit-aging expression** — `ring-core/src/engine.rs:169,287,307` — drift hazard. *fix:* extract one `aged_vit`/`read_slot` helper.
-- [ ] **33. `decode` `try_into().unwrap()` on the wire path** — `rrd/src/wire.rs:137` — sound today (length guaranteed) but fragile if refactored. *fix:* `try_into().map_err(|_| Truncated)?`.
+- [x] **32. DONE** — `route()` and `desired_routes()` now share one `Engine::aged_vit(d, now)` helper (the single read-time aging definition), removing the drift hazard.
+- [x] **33. DONE** — the wire decoder's three `try_into().unwrap()` (ipv6 octets, pot, vit) are now `try_into().map_err(|_| WireError::Truncated)?`, keeping the untrusted-boundary decoder panic-free under future refactors.
 - [ ] **34. UDP reader tasks detached; parked readers leak fds/buffers on transport drop** — `rrd/src/udp.rs:49` — benign for one never-dropped daemon, real for tests/reconfig. *fix:* retain JoinHandles + abort, or a CancellationToken.
 - [ ] **35. Inbound `src` `scope_id` not normalized; `(iface, src_ip)` keying drops it** — `rrd/src/udp.rs:172`, `runtime.rs:103` — correctness hinges entirely on `SO_BINDTODEVICE` tagging. *fix:* cross-check `scope_id` against iface or document the dependency.
 - [ ] **36. sim `node_prefix` wraps the hextet at >65535 nodes** — `ring-sim/src/fabric.rs:65` — latent foot-gun. *fix:* widen field or assert `n≤65535`.

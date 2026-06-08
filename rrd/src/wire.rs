@@ -238,7 +238,9 @@ pub fn decode(buf: &[u8]) -> Result<Message, WireError> {
         let dest = RouterId(read_str(buf, &mut pos)?);
 
         let ip_bytes = read_bytes(buf, &mut pos, 16)?;
-        let octets: [u8; 16] = ip_bytes.try_into().unwrap(); // always 16 bytes
+        // `read_bytes` guarantees exactly 16 bytes, so this conversion cannot fail today; the
+        // fallible form keeps the untrusted-boundary decoder panic-free even if refactored.
+        let octets: [u8; 16] = ip_bytes.try_into().map_err(|_| WireError::Truncated)?;
         let addr = Ipv6Addr::from(octets);
 
         let prefix_len = read_u8(buf, &mut pos)?;
@@ -250,7 +252,9 @@ pub fn decode(buf: &[u8]) -> Result<Message, WireError> {
         }
 
         let pot = f64::from_be_bytes(
-            read_bytes(buf, &mut pos, 8)?.try_into().unwrap(), // always 8 bytes
+            read_bytes(buf, &mut pos, 8)?
+                .try_into()
+                .map_err(|_| WireError::Truncated)?,
         );
         if !pot.is_finite() || pot < 0.0 {
             return Err(WireError::BadValue(format!(
@@ -260,7 +264,9 @@ pub fn decode(buf: &[u8]) -> Result<Message, WireError> {
         }
 
         let vit = f64::from_be_bytes(
-            read_bytes(buf, &mut pos, 8)?.try_into().unwrap(), // always 8 bytes
+            read_bytes(buf, &mut pos, 8)?
+                .try_into()
+                .map_err(|_| WireError::Truncated)?,
         );
         if !vit.is_finite() || !(0.0..=1.0).contains(&vit) {
             return Err(WireError::BadValue(format!(
