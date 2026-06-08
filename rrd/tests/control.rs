@@ -87,6 +87,7 @@ async fn control_socket_reports_status() {
             fib_ops_total: 4,
             fib_errors_total: 0,
             neighbors_pruned_total: 7,
+            neighbors_rejected_total: 5,
         },
     };
     let (snap_tx, rib_rx) = tokio::sync::watch::channel(snap);
@@ -101,6 +102,7 @@ async fn control_socket_reports_status() {
     assert_eq!(status.fib_ops, 4);
     assert_eq!(status.fib_errors, 0);
     assert_eq!(status.neighbors_pruned, 7);
+    assert_eq!(status.neighbors_rejected, 5);
 
     // Keep the sender alive so the receiver doesn't close before the query.
     drop(snap_tx);

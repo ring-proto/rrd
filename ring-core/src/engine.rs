@@ -123,16 +123,31 @@ impl Engine {
         self.local_origins.remove(dest).is_some()
     }
 
-    pub fn add_neighbor(&mut self, n: NeighborId) {
+    /// Admit a neighbour into the table. Returns `true` if the neighbour is present after the call
+    /// (it already existed — idempotent — or was newly inserted under the cap), `false` if it was a
+    /// NEW neighbour refused because the table is already at `cfg.max_neighbors` (the per-`(iface,
+    /// src)` spoofing DoS bound, analogous to `max_dests`). The reach-ball neighbour prune reclaims
+    /// silent peers, so the cap is a steady-state bound rather than a permanent mute.
+    pub fn add_neighbor(&mut self, n: NeighborId) -> bool {
+        if self.neighbors.contains_key(&n) {
+            return true; // already present — idempotent
+        }
+        if self.neighbors.len() >= self.cfg.max_neighbors {
+            return false; // over budget: refuse this new (untrusted) neighbour
+        }
         let pot = vec![0.0; self.ndest()];
-        self.neighbors.entry(n).or_insert(Peer {
-            id: None,
-            g: self.cfg.d,
-            pot,
-            hears: false,
-            heard: Mono::ZERO,
-            live_at: Mono::ZERO,
-        });
+        self.neighbors.insert(
+            n,
+            Peer {
+                id: None,
+                g: self.cfg.d,
+                pot,
+                hears: false,
+                heard: Mono::ZERO,
+                live_at: Mono::ZERO,
+            },
+        );
+        true
     }
 
     pub fn drop_neighbor(&mut self, n: NeighborId) {
@@ -988,6 +1003,40 @@ mod tests {
         a.ingest(Duration::ZERO, NeighborId(1), &refresh);
         assert_eq!(a.dest_count(), 2, "refresh of known dest does not grow");
         assert!(a.route(Duration::ZERO, &RouterId::from("b")).is_some());
+    }
+
+    #[test]
+    fn neighbor_budget_refuses_new_over_cap_but_is_idempotent_for_known() {
+        // max_neighbors caps the table the way max_dests caps interned dests: a NEW neighbour
+        // over the cap is refused (false), an already-present one is idempotently accepted (true).
+        let cfg = Config {
+            max_neighbors: 2,
+            ..Default::default()
+        };
+        let mut a = Engine::new(RouterId::from("a"), px(1), cfg, Default::default());
+        assert!(a.add_neighbor(NeighborId(1)), "first fits under the cap");
+        assert!(a.add_neighbor(NeighborId(2)), "second fits under the cap");
+        assert_eq!(a.neighbor_count(), 2);
+        // A THIRD new neighbour is over budget → refused, not inserted.
+        assert!(!a.add_neighbor(NeighborId(3)), "third is over the cap");
+        assert_eq!(a.neighbor_count(), 2, "refused neighbour is never inserted");
+        assert!(!a.has_neighbor(NeighborId(3)));
+        // An already-present neighbour is idempotently accepted even at the cap.
+        assert!(a.add_neighbor(NeighborId(1)), "known neighbour is idempotent at the cap");
+        assert_eq!(a.neighbor_count(), 2, "idempotent re-add does not grow");
+    }
+
+    #[test]
+    fn neighbor_cap_zero_refuses_all() {
+        // A zero cap refuses every neighbour — the operator's choice (matches max_dests: no
+        // lower-bound check). Documents the boundary case explicitly.
+        let cfg = Config {
+            max_neighbors: 0,
+            ..Default::default()
+        };
+        let mut a = Engine::new(RouterId::from("a"), px(1), cfg, Default::default());
+        assert!(!a.add_neighbor(NeighborId(1)), "zero cap refuses all neighbours");
+        assert_eq!(a.neighbor_count(), 0);
     }
 
     #[test]

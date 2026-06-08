@@ -26,6 +26,7 @@ pub struct Config {
     pub no_retard: bool, // ablation: adopt vitality un-aged (demonstrates Thm 6.2)
     pub no_link_age: bool, // ablation: keep stale link conductance frozen (dead-relay pin)
     pub max_dests: usize,  // hard cap on interned destinations (untrusted-intern DoS bound)
+    pub max_neighbors: usize, // hard cap on neighbour-table entries (per-(iface,src) spoofing DoS bound)
     pub gc_dwell: f64,     // ticks a non-origin slot must stay GC-eligible before reach-ball eviction
 }
 
@@ -48,6 +49,7 @@ impl Default for Config {
             no_retard: false,
             no_link_age: false,
             max_dests: 65_536,
+            max_neighbors: 1024, // generous vs any real node degree; bounds a spoofed-source flood
             gc_dwell: 32.0,
         }
     }
@@ -86,6 +88,7 @@ mod tests {
         assert!(!c.no_retard);
         assert!(!c.no_link_age);
         assert_eq!(c.max_dests, 65_536);
+        assert_eq!(c.max_neighbors, 1024);
         assert_eq!(c.gc_dwell, 32.0);
 
         // The alignment identities: reach λ = √(D/κ) and vitality horizon

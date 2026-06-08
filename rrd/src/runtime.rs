@@ -57,6 +57,9 @@ pub struct Metrics {
     /// Cumulative neighbours reclaimed by the engine (silent past the
     /// link-aging floor and backing no route), bounding the address maps.
     pub neighbors_pruned_total: u64,
+    /// Cumulative new neighbours refused because the engine's `max_neighbors`
+    /// cap was hit (the per-`(iface,src)` spoofing-flood DoS bound).
+    pub neighbors_rejected_total: u64,
 }
 
 /// A snapshot of the RIB published each tick.
@@ -109,6 +112,8 @@ pub struct Daemon<T: Transport> {
     fib_active: bool,
     /// Cumulative neighbours reclaimed by the engine's prune pass.
     neighbors_pruned: u64,
+    /// Cumulative new neighbours refused at the engine's `max_neighbors` cap.
+    neighbors_rejected: u64,
     /// Last canonicalised intent set handed to the FIB task, used as the dirty-check so a
     /// steady-state tick sends nothing (#13).
     last_intents: Vec<RouteIntent>,
@@ -159,6 +164,7 @@ impl<T: Transport> Daemon<T> {
             fib_installed: Arc::new(AtomicUsize::new(0)),
             fib_active: false,
             neighbors_pruned: 0,
+            neighbors_rejected: 0,
             last_intents: Vec::new(),
         };
         (daemon, rib_rx, local_origin_tx)
@@ -172,19 +178,35 @@ impl<T: Transport> Daemon<T> {
         self.start.elapsed()
     }
 
-    /// Resolve or allocate a NeighborId for `(iface, src_ip)`.
-    fn resolve_neighbor(&mut self, iface: u32, src_ip: Ipv6Addr) -> NeighborId {
+    /// Resolve or allocate a `NeighborId` for `(iface, src_ip)`.
+    ///
+    /// A cached `(iface, src)` always resolves to its existing id (steady state never rejects).
+    /// A NEW source is admitted only if the engine's `max_neighbors` cap has room: if
+    /// [`Engine::add_neighbor`] refuses it (`false`), the `(iface, src)` maps are left untouched
+    /// and `None` is returned (the caller drops the datagram), bounding the per-`(iface,src)`
+    /// spoofing flood. The cumulative rejection is counted here so it lives in one place.
+    fn resolve_neighbor(&mut self, iface: u32, src_ip: Ipv6Addr) -> Option<NeighborId> {
         let key = (iface, src_ip);
         if let Some(&nid) = self.neighbor_by_addr.get(&key) {
-            return nid;
+            return Some(nid);
         }
         let nid = NeighborId(self.next_nid);
         self.next_nid += 1;
+        if !self.engine.add_neighbor(nid) {
+            // Cap hit: do NOT keep any mapping for this new source. (next_nid is still advanced;
+            // the id is simply unused — cheap, and avoids reusing an id the engine just refused.)
+            self.neighbors_rejected += 1;
+            tracing::debug!(
+                "neighbor cap hit: refused new source iface={} src={} (max_neighbors)",
+                iface,
+                src_ip
+            );
+            return None;
+        }
         self.neighbor_by_addr.insert(key, nid);
         self.addr_by_neighbor.insert(nid, key);
-        self.engine.add_neighbor(nid);
         tracing::debug!("new neighbor {:?} from iface={} src={}", nid, iface, src_ip);
-        nid
+        Some(nid)
     }
 
     /// Handle a decoded inbound datagram.
@@ -193,7 +215,13 @@ impl<T: Transport> Daemon<T> {
         match wire::decode(&inb.data) {
             Ok(msg) => {
                 let src_ip = *inb.src.ip();
-                let nid = self.resolve_neighbor(inb.iface, src_ip);
+                // Resolve (or admit) the source's neighbour id. A NEW source refused at the
+                // engine's `max_neighbors` cap yields None: drop the datagram without ingesting,
+                // bounding the per-(iface,src) spoofing flood. The cached path never rejects.
+                let Some(nid) = self.resolve_neighbor(inb.iface, src_ip) else {
+                    tracing::debug!("dropped datagram from {} (neighbor cap hit)", src_ip);
+                    return;
+                };
 
                 // Learn prefix → RouterId mapping from every advertised entry. The
                 // primary self-pin has dest == msg.from; dynamic local origins use
@@ -356,6 +384,7 @@ impl<T: Transport> Daemon<T> {
             fib_ops_total: self.fib_ops.load(Ordering::Relaxed),
             fib_errors_total: self.fib_errors.load(Ordering::Relaxed),
             neighbors_pruned_total: self.neighbors_pruned,
+            neighbors_rejected_total: self.neighbors_rejected,
         };
         RibSnapshot { routable, metrics }
     }
@@ -482,6 +511,7 @@ impl<T: Transport> Daemon<T> {
                             fib_ops = m.fib_ops_total,
                             fib_errors = m.fib_errors_total,
                             neighbors_pruned = m.neighbors_pruned_total,
+                            neighbors_rejected = m.neighbors_rejected_total,
                             "rrd status"
                         );
                         prev_rx = m.datagrams_rx_total;
@@ -692,5 +722,58 @@ mod tests {
         let snap = daemon.build_snapshot();
         assert_eq!(snap.metrics.datagrams_rx_total, 1);
         assert_eq!(snap.metrics.decode_errors_total, 1);
+    }
+
+    #[tokio::test]
+    async fn neighbor_cap_drops_spoofed_sources_past_the_limit() {
+        use crate::transport::Inbound;
+        use ring_core::{Entry, Message};
+        use std::net::SocketAddrV6;
+
+        // A small cap so a handful of distinct spoofed (iface,src) sources exceed it.
+        let mut transports = MemBus::fully_connected(1);
+        let t = transports.remove(0);
+        let mut cfg = make_config("n0", "fd00::1".parse().unwrap(), 100);
+        cfg.cfg.max_neighbors = 3;
+        let (mut daemon, _rx) = Daemon::new(cfg, t);
+
+        // A valid advert from a peer "b" (so the datagram decodes and would be ingested).
+        let msg = Message {
+            from: RouterId("b".into()),
+            hears: vec![],
+            delta: vec![Entry {
+                dest: RouterId("b".into()),
+                prefix: Prefix { addr: "fd00:2::".parse().unwrap(), len: 64 },
+                pot: 1.0,
+                vit: 1.0,
+            }],
+        };
+        let data = wire::encode(&msg);
+
+        // Five distinct link-local sources on one iface: the first 3 are admitted, the rest
+        // are refused at the cap and their datagrams dropped.
+        for i in 1u16..=5 {
+            let src = SocketAddrV6::new(
+                format!("fe80::{i}").parse().unwrap(),
+                6699,
+                0,
+                1,
+            );
+            daemon.handle_inbound(Inbound { iface: 1, src, data: data.clone() });
+        }
+
+        let snap = daemon.build_snapshot();
+        assert_eq!(snap.metrics.neighbors, 3, "exactly max_neighbors admitted");
+        assert_eq!(snap.metrics.neighbors_rejected_total, 2, "two over-cap sources refused");
+        // All five datagrams were received (counted), even the dropped ones.
+        assert_eq!(snap.metrics.datagrams_rx_total, 5);
+
+        // A previously-admitted source still resolves (steady state never rejects): re-feeding
+        // it does not increment the rejection counter.
+        let known = SocketAddrV6::new("fe80::1".parse().unwrap(), 6699, 0, 1);
+        daemon.handle_inbound(Inbound { iface: 1, src: known, data: data.clone() });
+        let snap2 = daemon.build_snapshot();
+        assert_eq!(snap2.metrics.neighbors, 3, "no new neighbour from a known source");
+        assert_eq!(snap2.metrics.neighbors_rejected_total, 2, "known source is not a rejection");
     }
 }

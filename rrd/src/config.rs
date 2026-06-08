@@ -80,6 +80,10 @@ pub struct Cli {
     #[arg(long, default_value_t = 65536)]
     pub max_dests: usize,
 
+    /// Maximum number of neighbours the engine will admit (per-`(iface,src)` spoofing DoS bound).
+    #[arg(long, default_value_t = 1024)]
+    pub max_neighbors: usize,
+
     /// Ticks a drained, dead, non-origin destination must dwell before reach-ball GC evicts it.
     #[arg(long, default_value_t = 32.0)]
     pub gc_dwell: f64,
@@ -133,6 +137,7 @@ impl DaemonConfig {
         let mut cfg = Config {
             tick: Duration::from_millis(cli.tick_ms),
             max_dests: cli.max_dests,
+            max_neighbors: cli.max_neighbors,
             gc_dwell: cli.gc_dwell,
             ..Config::default()
         };
@@ -243,8 +248,9 @@ mod tests {
         assert_eq!(cli.prefix, "fd00:0:1::/64");
         assert_eq!(cli.ifaces, vec!["lo"]);
         assert_eq!(cli.control_socket.as_deref(), Some("/tmp/rrd.sock"));
-        // dest-budget / GC flags default when unset.
+        // dest-budget / neighbour-budget / GC flags default when unset.
         assert_eq!(cli.max_dests, 65536);
+        assert_eq!(cli.max_neighbors, 1024);
         assert_eq!(cli.gc_dwell, 32.0);
     }
 
@@ -256,14 +262,18 @@ mod tests {
             "fd00:0:1::/64",
             "--max-dests",
             "1024",
+            "--max-neighbors",
+            "256",
             "--gc-dwell",
             "12.5",
         ];
         let cli = Cli::try_parse_from(args).expect("should parse");
         assert_eq!(cli.max_dests, 1024);
+        assert_eq!(cli.max_neighbors, 256);
         assert_eq!(cli.gc_dwell, 12.5);
         let dc = DaemonConfig::from_cli(&cli).expect("should build");
         assert_eq!(dc.cfg.max_dests, 1024);
+        assert_eq!(dc.cfg.max_neighbors, 256);
         assert_eq!(dc.cfg.gc_dwell, 12.5);
     }
 
@@ -278,6 +288,7 @@ mod tests {
             alpha: None,
             phi: None,
             max_dests: 65536,
+            max_neighbors: 1024,
             gc_dwell: 32.0,
             no_fib: false,
             max_paths: 4,
@@ -303,6 +314,7 @@ mod tests {
             alpha: None,
             phi: None,
             max_dests: 65536,
+            max_neighbors: 1024,
             gc_dwell: 32.0,
             no_fib: true,
             max_paths: 0,
@@ -324,6 +336,7 @@ mod tests {
             alpha: None,
             phi: None,
             max_dests: 65536,
+            max_neighbors: 1024,
             gc_dwell: 32.0,
             no_fib: false,
             max_paths: 1,
