@@ -34,7 +34,8 @@ impl LinkSpec {
 pub(crate) struct NodeState {
     pub engine: Engine,
     pub id: RouterId,
-    pub clock_offset: Duration, // local_now(global) = global + clock_offset (models constant skew)
+    pub clock_offset: Duration, // local_now(global) = clock_offset + rate*global (constant skew)
+    pub rate: f64,              // proper-time RATE multiplier: 1.0 = nominal; ≠1.0 models real drift
     pub up: bool,
 }
 
@@ -136,6 +137,7 @@ impl Fabric {
                 engine,
                 id,
                 clock_offset: Duration::from_nanos(off_nanos as u64),
+                rate: 1.0,
                 up: true,
             });
         }
@@ -176,6 +178,30 @@ impl Fabric {
     pub fn build_aligned(n: usize, links: &[LinkSpec], cfg: Config, seed: u64) -> Self {
         let skews = vec![0i64; n];
         Self::build(n, links, &skews, cfg, seed)
+    }
+
+    /// Like [`Fabric::build`], but each node's proper-time clock additionally runs at its own RATE
+    /// (`rates[i]`, nominal 1.0). Unlike a constant skew — which cancels in every same-clock diff
+    /// and so cannot change outcomes — a rate difference is genuine clock drift: it does not cancel
+    /// in the fixed-transit cross-node evidence, exercising the protocol's clock-freedom under real
+    /// asynchrony. Each rate must be finite and > 0 (a non-monotonic clock is nonsensical).
+    pub fn build_with_rates(
+        n: usize,
+        links: &[LinkSpec],
+        skews: &[i64],
+        rates: &[f64],
+        cfg: Config,
+        seed: u64,
+    ) -> Self {
+        assert_eq!(rates.len(), n, "one rate per node");
+        for (i, &r) in rates.iter().enumerate() {
+            assert!(r.is_finite() && r > 0.0, "node {i} rate {r} must be finite and > 0");
+        }
+        let mut fab = Self::build(n, links, skews, cfg, seed);
+        for (ns, &r) in fab.nodes.iter_mut().zip(rates) {
+            ns.rate = r;
+        }
+        fab
     }
 
     /// A path graph 0-1-…-(n-1) of clean links.
@@ -227,8 +253,19 @@ impl Fabric {
 }
 
 impl Fabric {
+    /// Node `node`'s local proper time: `clock_offset + rate * global`. With the default
+    /// `rate == 1.0` this is exactly `global + clock_offset` (a constant skew, provably invisible
+    /// to the clock-free protocol). A `rate != 1.0` models REAL clock drift — the node's proper
+    /// time advances faster/slower than wall time — which does NOT cancel in cross-node evidence
+    /// (the fixed 1-tick transit and staleness diffs no longer line up), so it is a genuine test
+    /// of clock-freedom: the protocol must still converge and sever under drift (see `skew.rs`).
     fn local(&self, node: usize) -> Duration {
-        self.time + self.nodes[node].clock_offset
+        let ns = &self.nodes[node];
+        if ns.rate == 1.0 {
+            return self.time + ns.clock_offset; // fast path: bit-identical to the no-drift sim
+        }
+        let scaled = self.time.as_nanos() as f64 * ns.rate;
+        ns.clock_offset + Duration::from_nanos(scaled as u64)
     }
 
     fn do_emit(&mut self, node: usize) {
