@@ -1,227 +1,220 @@
-//! Local control socket for injecting dynamic local origins into `rrd`.
+//! JSON-RPC 2.0 control socket for `rrd`.
+//!
+//! One request object per connection (newline-terminated). Methods:
+//! `status`, `dump_rib`, `neighbors` (reads) and `add_local_origin`,
+//! `remove_local_origin` (mutations). Mutations require an authorized peer
+//! (`SO_PEERCRED`): the daemon's own uid or root. The socket file is created
+//! 0600 with a 0700 parent.
 
 use crate::config::parse_prefix;
-use crate::runtime::LocalOriginCommand;
-use ring_core::{Prefix, RouterId};
-use serde::Deserialize;
-use serde_json::json;
+use crate::runtime::{ControlCommand, QueryMethod};
+use ring_core::RouterId;
+use rrd_proto::{codes, method, Request, Response};
 use std::io;
+use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{UnixListener, UnixStream};
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, oneshot};
 
-#[derive(Clone, Debug)]
-pub enum ControlRequest {
-    AddLocalOrigin { dest: RouterId, prefix: Prefix },
-    RemoveLocalOrigin { dest: RouterId },
+/// Who may invoke mutating methods. Reads are always allowed.
+#[derive(Clone, Copy, Debug)]
+pub struct Authz {
+    /// uid permitted to mutate, in addition to root (uid 0). Typically the
+    /// daemon's own uid.
+    pub allowed_uid: u32,
 }
 
-#[derive(Debug, Deserialize)]
-struct WireRequest {
-    #[serde(rename = "type")]
-    request_type: String,
-    #[serde(default)]
-    dest: String,
-    #[serde(default)]
-    prefix: String,
+impl Authz {
+    /// Default: allow the daemon's own uid (and root).
+    pub fn for_self() -> Self {
+        Authz {
+            allowed_uid: nix::unistd::getuid().as_raw(),
+        }
+    }
+    fn permits_mutation(&self, peer_uid: u32) -> bool {
+        peer_uid == 0 || peer_uid == self.allowed_uid
+    }
 }
 
 pub async fn run_control_socket(
     path: impl Into<PathBuf>,
-    tx: mpsc::UnboundedSender<LocalOriginCommand>,
-    rib_rx: tokio::sync::watch::Receiver<crate::runtime::RibSnapshot>,
+    tx: mpsc::UnboundedSender<ControlCommand>,
+    authz: Authz,
 ) -> io::Result<()> {
     let path = path.into();
     let listener = bind_socket(&path)?;
     loop {
         let (stream, _) = listener.accept().await?;
         let tx = tx.clone();
-        let rib_rx = rib_rx.clone();
         tokio::spawn(async move {
-            if let Err(error) = handle_stream(stream, tx, rib_rx).await {
+            if let Err(error) = handle_stream(stream, tx, authz).await {
                 tracing::warn!(%error, "control socket request failed");
             }
         });
     }
 }
 
-pub async fn send_control_request(
-    path: impl AsRef<Path>,
-    request: ControlRequest,
-) -> io::Result<()> {
-    let payload = match request {
-        ControlRequest::AddLocalOrigin { dest, prefix } => json!({
-            "type": "add_local_origin",
-            "dest": dest.0,
-            "prefix": format!("{}/{}", prefix.addr, prefix.len),
-        }),
-        ControlRequest::RemoveLocalOrigin { dest } => json!({
-            "type": "remove_local_origin",
-            "dest": dest.0,
-        }),
-    };
-
-    let mut last_error = None;
-    for _ in 0..50 {
-        match UnixStream::connect(path.as_ref()).await {
-            Ok(mut stream) => {
-                stream
-                    .write_all(format!("{}\n", payload).as_bytes())
-                    .await?;
-                let mut reader = BufReader::new(stream);
-                let mut line = String::new();
-                reader.read_line(&mut line).await?;
-                let response: serde_json::Value =
-                    serde_json::from_str(line.trim()).map_err(io::Error::other)?;
-                if response.get("type").and_then(|v| v.as_str()) == Some("ok") {
-                    return Ok(());
-                }
-                return Err(io::Error::other(response.to_string()));
-            }
-            Err(error)
-                if matches!(
-                    error.kind(),
-                    io::ErrorKind::NotFound | io::ErrorKind::ConnectionRefused
-                ) =>
-            {
-                last_error = Some(error);
-                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-            }
-            Err(error) => return Err(error),
-        }
-    }
-    Err(last_error.unwrap_or_else(|| io::Error::other("control socket unavailable")))
-}
-
-/// A typed view of the daemon's `status` reply over the control socket. The
-/// reply's `routable` array is ignored by serde here.
-#[derive(Debug, Clone, serde::Deserialize)]
-pub struct StatusReply {
-    pub dests: usize,
-    pub neighbors: usize,
-    pub routes: usize,
-    pub datagrams_rx: u64,
-    pub decode_errors: u64,
-    pub fib_ops: u64,
-    pub fib_errors: u64,
-    pub neighbors_pruned: u64,
-    pub neighbors_rejected: u64,
-}
-
-/// Query the daemon's status over its control socket.
-pub async fn query_status(path: impl AsRef<Path>) -> io::Result<StatusReply> {
-    let mut last_error = None;
-    for _ in 0..50 {
-        match UnixStream::connect(path.as_ref()).await {
-            Ok(mut stream) => {
-                stream.write_all(b"{\"type\":\"status\"}\n").await?;
-                let mut reader = BufReader::new(stream);
-                let mut line = String::new();
-                reader.read_line(&mut line).await?;
-                return serde_json::from_str::<StatusReply>(line.trim()).map_err(io::Error::other);
-            }
-            Err(error)
-                if matches!(
-                    error.kind(),
-                    io::ErrorKind::NotFound | io::ErrorKind::ConnectionRefused
-                ) =>
-            {
-                last_error = Some(error);
-                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-            }
-            Err(error) => return Err(error),
-        }
-    }
-    Err(last_error.unwrap_or_else(|| io::Error::other("control socket unavailable")))
-}
-
 async fn handle_stream(
     stream: UnixStream,
-    tx: mpsc::UnboundedSender<LocalOriginCommand>,
-    rib_rx: tokio::sync::watch::Receiver<crate::runtime::RibSnapshot>,
+    tx: mpsc::UnboundedSender<ControlCommand>,
+    authz: Authz,
 ) -> io::Result<()> {
+    let peer_uid = peer_uid(&stream)?;
     let mut reader = BufReader::new(stream);
     let mut line = String::new();
     reader.read_line(&mut line).await?;
-    let line = line.trim();
 
-    // Peek the request type so `status` queries can be answered from the RIB
-    // watch channel without going through the add/remove command path.
-    let req_type = serde_json::from_str::<WireRequest>(line)
-        .map(|r| r.request_type)
-        .unwrap_or_default();
-
-    let response = if req_type == "status" {
-        // Extract owned values from the borrow guard and build the reply fully
-        // before any `.await`, so the guard is never held across the write.
-        let snap = rib_rx.borrow();
-        let m = &snap.metrics;
-        let routable: Vec<_> = snap
-            .routable
-            .iter()
-            .map(|(rid, p)| {
-                json!({
-                    "router_id": rid.0,
-                    "prefix": format!("{}/{}", p.addr, p.len),
-                })
-            })
-            .collect();
-        let reply = json!({
-            "type": "status",
-            "dests": m.dests,
-            "neighbors": m.neighbors,
-            "routes": m.routes,
-            "datagrams_rx": m.datagrams_rx_total,
-            "decode_errors": m.decode_errors_total,
-            "fib_ops": m.fib_ops_total,
-            "fib_errors": m.fib_errors_total,
-            "neighbors_pruned": m.neighbors_pruned_total,
-            "neighbors_rejected": m.neighbors_rejected_total,
-            "routable": routable,
-        });
-        drop(snap);
-        reply
-    } else {
-        match parse_wire_request(line) {
-            Ok(cmd) => match tx.send(cmd) {
-                Ok(()) => json!({"type": "ok"}),
-                Err(_) => {
-                    json!({"type": "error", "error": "rrd runtime command channel is closed"})
-                }
-            },
-            Err(error) => json!({"type": "error", "error": error}),
-        }
-    };
+    let response = dispatch(line.trim(), &tx, peer_uid, authz).await;
+    let body = serde_json::to_string(&response).unwrap_or_else(|_| {
+        r#"{"jsonrpc":"2.0","id":null,"error":{"code":-32603,"message":"serialize"}}"#.into()
+    });
 
     let mut stream = reader.into_inner();
-    stream.write_all(format!("{}\n", response).as_bytes()).await
+    stream.write_all(body.as_bytes()).await?;
+    stream.write_all(b"\n").await
 }
 
-fn parse_wire_request(line: &str) -> Result<LocalOriginCommand, String> {
-    let req: WireRequest =
-        serde_json::from_str(line).map_err(|error| format!("invalid control request: {error}"))?;
-    match req.request_type.as_str() {
-        "add_local_origin" => {
-            if req.dest.is_empty() {
-                return Err("add_local_origin requires dest".to_string());
-            }
-            let prefix = parse_prefix(&req.prefix)?;
-            Ok(LocalOriginCommand::Add {
-                dest: RouterId(req.dest),
-                prefix,
-            })
+async fn dispatch(
+    line: &str,
+    tx: &mpsc::UnboundedSender<ControlCommand>,
+    peer_uid: u32,
+    authz: Authz,
+) -> Response {
+    let req: Request = match serde_json::from_str(line) {
+        Ok(r) => r,
+        Err(e) => {
+            return Response::error(serde_json::Value::Null, codes::PARSE_ERROR, e.to_string())
         }
-        "remove_local_origin" => {
-            if req.dest.is_empty() {
-                return Err("remove_local_origin requires dest".to_string());
-            }
-            Ok(LocalOriginCommand::Remove {
-                dest: RouterId(req.dest),
-            })
-        }
-        other => Err(format!("unknown control request: {other}")),
+    };
+    if !req.is_valid() {
+        return Response::error(req.id, codes::INVALID_REQUEST, "jsonrpc must be \"2.0\"");
     }
+
+    match req.method.as_str() {
+        method::STATUS => query(tx, req.id, QueryMethod::Status).await,
+        method::DUMP_RIB => query(tx, req.id, QueryMethod::DumpRib).await,
+        method::NEIGHBORS => query(tx, req.id, QueryMethod::Neighbors).await,
+        method::ADD_LOCAL_ORIGIN => {
+            if !authz.permits_mutation(peer_uid) {
+                return Response::error(req.id, codes::UNAUTHORIZED, "uid not permitted");
+            }
+            let p: rrd_proto::AddLocalOriginParams = match serde_json::from_value(req.params) {
+                Ok(p) => p,
+                Err(e) => return Response::error(req.id, codes::INVALID_PARAMS, e.to_string()),
+            };
+            if p.dest.is_empty() {
+                return Response::error(req.id, codes::INVALID_PARAMS, "dest is required");
+            }
+            let prefix = match parse_prefix(&p.prefix) {
+                Ok(px) => px,
+                Err(e) => return Response::error(req.id, codes::INVALID_PARAMS, e),
+            };
+            send_mutation(
+                tx,
+                req.id,
+                ControlCommand::AddLocalOrigin {
+                    dest: RouterId(p.dest),
+                    prefix,
+                },
+            )
+        }
+        method::REMOVE_LOCAL_ORIGIN => {
+            if !authz.permits_mutation(peer_uid) {
+                return Response::error(req.id, codes::UNAUTHORIZED, "uid not permitted");
+            }
+            let p: rrd_proto::RemoveLocalOriginParams = match serde_json::from_value(req.params) {
+                Ok(p) => p,
+                Err(e) => return Response::error(req.id, codes::INVALID_PARAMS, e.to_string()),
+            };
+            if p.dest.is_empty() {
+                return Response::error(req.id, codes::INVALID_PARAMS, "dest is required");
+            }
+            send_mutation(
+                tx,
+                req.id,
+                ControlCommand::RemoveLocalOrigin {
+                    dest: RouterId(p.dest),
+                },
+            )
+        }
+        other => Response::error(
+            req.id,
+            codes::METHOD_NOT_FOUND,
+            format!("unknown method: {other}"),
+        ),
+    }
+}
+
+async fn query(
+    tx: &mpsc::UnboundedSender<ControlCommand>,
+    id: rrd_proto::Id,
+    method: QueryMethod,
+) -> Response {
+    let (reply_tx, reply_rx) = oneshot::channel();
+    if tx
+        .send(ControlCommand::Query {
+            method,
+            reply: reply_tx,
+        })
+        .is_err()
+    {
+        return Response::error(id, codes::RUNTIME_UNAVAILABLE, "runtime channel closed");
+    }
+    match reply_rx.await {
+        Ok(value) => Response::ok(id, value),
+        Err(_) => Response::error(id, codes::INTERNAL_ERROR, "query dropped"),
+    }
+}
+
+fn send_mutation(
+    tx: &mpsc::UnboundedSender<ControlCommand>,
+    id: rrd_proto::Id,
+    cmd: ControlCommand,
+) -> Response {
+    match tx.send(cmd) {
+        Ok(()) => Response::ok(
+            id,
+            serde_json::to_value(rrd_proto::Ack { ok: true }).unwrap_or(serde_json::Value::Null),
+        ),
+        Err(_) => Response::error(id, codes::RUNTIME_UNAVAILABLE, "runtime channel closed"),
+    }
+}
+
+/// Read the connecting peer's uid via `SO_PEERCRED`.
+fn peer_uid(stream: &UnixStream) -> io::Result<u32> {
+    let creds = nix::sys::socket::getsockopt(stream, nix::sys::socket::sockopt::PeerCredentials)
+        .map_err(io::Error::other)?;
+    Ok(creds.uid())
+}
+
+/// Connect (with brief retry) and perform one JSON-RPC request/response.
+pub async fn call(path: impl AsRef<Path>, request: &Request) -> io::Result<Response> {
+    let mut last_error = None;
+    for _ in 0..50 {
+        match UnixStream::connect(path.as_ref()).await {
+            Ok(mut stream) => {
+                let mut body = serde_json::to_vec(request).map_err(io::Error::other)?;
+                body.push(b'\n');
+                stream.write_all(&body).await?;
+                let mut reader = BufReader::new(stream);
+                let mut line = String::new();
+                reader.read_line(&mut line).await?;
+                return serde_json::from_str::<Response>(line.trim()).map_err(io::Error::other);
+            }
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    io::ErrorKind::NotFound | io::ErrorKind::ConnectionRefused
+                ) =>
+            {
+                last_error = Some(error);
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+            Err(error) => return Err(error),
+        }
+    }
+    Err(last_error.unwrap_or_else(|| io::Error::other("control socket unavailable")))
 }
 
 fn bind_socket(path: &Path) -> io::Result<UnixListener> {
@@ -230,6 +223,11 @@ fn bind_socket(path: &Path) -> io::Result<UnixListener> {
     }
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
+        // Best-effort: restrict the parent dir to the owner.
+        let _ = std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700));
     }
-    UnixListener::bind(path)
+    let listener = UnixListener::bind(path)?;
+    // Restrict the socket to the owner before anyone can connect.
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
+    Ok(listener)
 }

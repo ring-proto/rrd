@@ -1,110 +1,94 @@
-use ring_core::{Prefix, RouterId};
-use rrd::control::{query_status, send_control_request, ControlRequest};
-use rrd::runtime::{LocalOriginCommand, Metrics, RibSnapshot};
+//! Integration tests for the JSON-RPC control socket.
+//!
+//! These drive `run_control_socket` against a stand-in `ControlCommand` channel
+//! (not a full `Daemon`), exercising the JSON-RPC framing, the query/oneshot
+//! path, and the mutation forwarding path end-to-end over a real Unix socket.
+
+use rrd::control::{call, run_control_socket, Authz};
+use rrd::runtime::{ControlCommand, QueryMethod};
+use rrd_proto::{method, Request, StatusResult};
 use std::time::Duration;
 use tokio::sync::mpsc;
 
 #[tokio::test]
-async fn control_socket_translates_add_and_remove_local_origin_requests() {
+async fn status_returns_a_jsonrpc_result() {
     let dir = tempfile::tempdir().unwrap();
-    let socket = dir.path().join("rrd.sock");
-    let (tx, mut rx) = mpsc::unbounded_channel::<LocalOriginCommand>();
-    let (_snap_tx, rib_rx) = tokio::sync::watch::channel(RibSnapshot::default());
-    let server = tokio::spawn(rrd::control::run_control_socket(socket.clone(), tx, rib_rx));
+    let path = dir.path().join("ctl.sock");
+    let (tx, mut rx) = mpsc::unbounded_channel::<ControlCommand>();
 
-    send_control_request(
-        &socket,
-        ControlRequest::AddLocalOrigin {
-            dest: RouterId("pod:default/demo".to_string()),
-            prefix: Prefix {
-                addr: "fd00:ffff::1".parse().unwrap(),
-                len: 128,
-            },
-        },
-    )
-    .await
-    .unwrap();
-
-    match tokio::time::timeout(Duration::from_secs(2), rx.recv())
-        .await
-        .unwrap()
-        .unwrap()
-    {
-        LocalOriginCommand::Add { dest, prefix } => {
-            assert_eq!(dest.0, "pod:default/demo");
-            assert_eq!(
-                prefix.addr,
-                "fd00:ffff::1".parse::<std::net::Ipv6Addr>().unwrap()
-            );
-            assert_eq!(prefix.len, 128);
+    // Stand in for the daemon loop: answer Query::Status with a canned StatusResult.
+    tokio::spawn(async move {
+        while let Some(cmd) = rx.recv().await {
+            if let ControlCommand::Query {
+                method: QueryMethod::Status,
+                reply,
+            } = cmd
+            {
+                let v = serde_json::to_value(StatusResult {
+                    proto_version: rrd_proto::PROTO_VERSION,
+                    dests: 3,
+                    neighbors: 2,
+                    routes: 1,
+                    datagrams_rx: 0,
+                    decode_errors: 0,
+                    fib_ops: 0,
+                    fib_errors: 0,
+                    neighbors_pruned: 0,
+                    neighbors_rejected: 0,
+                })
+                .unwrap();
+                let _ = reply.send(v);
+            }
         }
-        other => panic!("expected add command, got {other:?}"),
-    }
+    });
 
-    send_control_request(
-        &socket,
-        ControlRequest::RemoveLocalOrigin {
-            dest: RouterId("pod:default/demo".to_string()),
-        },
-    )
-    .await
-    .unwrap();
+    let server_path = path.clone();
+    tokio::spawn(async move {
+        let _ = run_control_socket(server_path, tx, Authz::for_self()).await;
+    });
+    tokio::time::sleep(Duration::from_millis(50)).await;
 
-    match tokio::time::timeout(Duration::from_secs(2), rx.recv())
-        .await
-        .unwrap()
-        .unwrap()
-    {
-        LocalOriginCommand::Remove { dest } => assert_eq!(dest.0, "pod:default/demo"),
-        other => panic!("expected remove command, got {other:?}"),
-    }
-
-    server.abort();
+    let req = Request::new(serde_json::json!(1), method::STATUS, serde_json::Value::Null);
+    let resp = call(&path, &req).await.unwrap();
+    assert!(resp.error.is_none(), "unexpected error: {:?}", resp.error);
+    let status: StatusResult = serde_json::from_value(resp.result.unwrap()).unwrap();
+    assert_eq!(status.dests, 3);
+    assert_eq!(status.proto_version, rrd_proto::PROTO_VERSION);
 }
 
 #[tokio::test]
-async fn control_socket_reports_status() {
+async fn add_local_origin_forwards_a_command() {
     let dir = tempfile::tempdir().unwrap();
-    let socket = dir.path().join("rrd.sock");
-    let (tx, _rx) = mpsc::unbounded_channel::<LocalOriginCommand>();
+    let path = dir.path().join("ctl.sock");
+    let (tx, mut rx) = mpsc::unbounded_channel::<ControlCommand>();
 
-    // Seed the watch channel with a non-default snapshot so the assertions are
-    // meaningful.
-    let snap = RibSnapshot {
-        routable: vec![(
-            RouterId("n1".into()),
-            Prefix {
-                addr: "fd00:1::".parse().unwrap(),
-                len: 64,
-            },
-        )],
-        metrics: Metrics {
-            dests: 3,
-            neighbors: 2,
-            routes: 1,
-            datagrams_rx_total: 10,
-            decode_errors_total: 1,
-            fib_ops_total: 4,
-            fib_errors_total: 0,
-            neighbors_pruned_total: 7,
-            neighbors_rejected_total: 5,
-        },
-    };
-    let (snap_tx, rib_rx) = tokio::sync::watch::channel(snap);
-    let server = tokio::spawn(rrd::control::run_control_socket(socket.clone(), tx, rib_rx));
+    let got = std::sync::Arc::new(std::sync::Mutex::new(None));
+    let got2 = got.clone();
+    tokio::spawn(async move {
+        if let Some(ControlCommand::AddLocalOrigin { dest, prefix }) = rx.recv().await {
+            *got2.lock().unwrap() = Some((dest.0, format!("{}/{}", prefix.addr, prefix.len)));
+        }
+    });
 
-    let status = query_status(&socket).await.unwrap();
-    assert_eq!(status.dests, 3);
-    assert_eq!(status.neighbors, 2);
-    assert_eq!(status.routes, 1);
-    assert_eq!(status.datagrams_rx, 10);
-    assert_eq!(status.decode_errors, 1);
-    assert_eq!(status.fib_ops, 4);
-    assert_eq!(status.fib_errors, 0);
-    assert_eq!(status.neighbors_pruned, 7);
-    assert_eq!(status.neighbors_rejected, 5);
+    let server_path = path.clone();
+    tokio::spawn(async move {
+        let _ = run_control_socket(server_path, tx, Authz::for_self()).await;
+    });
+    tokio::time::sleep(Duration::from_millis(50)).await;
 
-    // Keep the sender alive so the receiver doesn't close before the query.
-    drop(snap_tx);
-    server.abort();
+    let params = serde_json::to_value(rrd_proto::AddLocalOriginParams {
+        dest: "pod:default/x".into(),
+        prefix: "fd00:abcd::/64".into(),
+    })
+    .unwrap();
+    let req = Request::new(serde_json::json!(2), method::ADD_LOCAL_ORIGIN, params);
+    let resp = call(&path, &req).await.unwrap();
+    assert!(resp.error.is_none());
+
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    let recorded = got.lock().unwrap().clone();
+    assert_eq!(
+        recorded,
+        Some(("pod:default/x".to_string(), "fd00:abcd::/64".to_string()))
+    );
 }

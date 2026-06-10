@@ -6,7 +6,7 @@
 
 use ring_core::{Config, ForwardingPolicy, Prefix, RouterId};
 use rrd::config::DaemonConfig;
-use rrd::runtime::{Daemon, LocalOriginCommand, RibSnapshot};
+use rrd::runtime::{ControlCommand, Daemon, RibSnapshot};
 use rrd::transport::MemBus;
 use std::net::Ipv6Addr;
 use std::time::Duration;
@@ -233,7 +233,7 @@ async fn dynamic_local_origin_diffuses_and_withdraws() {
 
     let pod_id = RouterId("pod:default/demo".to_string());
     origin_controls[2]
-        .send(LocalOriginCommand::Add {
+        .send(ControlCommand::AddLocalOrigin {
             dest: pod_id.clone(),
             prefix: Prefix {
                 addr: "fd00:ffff::1".parse().unwrap(),
@@ -248,7 +248,7 @@ async fn dynamic_local_origin_diffuses_and_withdraws() {
     );
 
     origin_controls[2]
-        .send(LocalOriginCommand::Remove {
+        .send(ControlCommand::RemoveLocalOrigin {
             dest: pod_id.clone(),
         })
         .unwrap();
@@ -298,7 +298,7 @@ async fn dynamic_local_origin_prefix_update_replaces_remote_route() {
     };
 
     origin_controls[2]
-        .send(LocalOriginCommand::Add {
+        .send(ControlCommand::AddLocalOrigin {
             dest: pod_id.clone(),
             prefix: p1,
         })
@@ -309,7 +309,7 @@ async fn dynamic_local_origin_prefix_update_replaces_remote_route() {
     );
 
     origin_controls[2]
-        .send(LocalOriginCommand::Add {
+        .send(ControlCommand::AddLocalOrigin {
             dest: pod_id.clone(),
             prefix: p2,
         })

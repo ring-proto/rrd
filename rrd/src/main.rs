@@ -6,7 +6,7 @@
 use anyhow::Context;
 use clap::Parser;
 use rrd::config::{Cli, DaemonConfig};
-use rrd::control::run_control_socket;
+use rrd::control::{run_control_socket, Authz};
 use rrd::runtime::Daemon;
 use rrd::udp::Udp6Transport;
 use tracing_subscriber::EnvFilter;
@@ -55,22 +55,23 @@ async fn daemon_main() -> anyhow::Result<()> {
 
     let control_socket = daemon_cfg.control_socket.clone();
 
-    // Construct the daemon. `Daemon::new_controlled` returns `(daemon, rib_rx, origin_tx)`.
-    // The `rib_rx` is handed to the control socket so `status` queries can read the
-    // latest published metrics/RIB.
-    let (daemon, rib_rx, origin_tx) = Daemon::new_controlled(daemon_cfg, transport);
+    // Construct the daemon. `Daemon::new_controlled` returns `(daemon, rib_rx, control_tx)`.
+    let (daemon, rib_rx, control_tx) = Daemon::new_controlled(daemon_cfg, transport);
 
     if let Some(path) = control_socket {
         tracing::info!(path = %path.display(), "rrd control socket enabled");
+        // `rib_rx` is retained for the metrics HTTP endpoint (plan 2); not needed here.
+        drop(rib_rx);
+        let authz = Authz::for_self();
         tokio::spawn(async move {
-            if let Err(error) = run_control_socket(path, origin_tx, rib_rx).await {
+            if let Err(error) = run_control_socket(path, control_tx, authz).await {
                 tracing::warn!(%error, "rrd control socket stopped");
             }
         });
     } else {
-        // No control socket: the RIB receiver has no consumer. Drop it explicitly
-        // so it doesn't read as an accidental unused binding.
+        // No control socket: neither the RIB receiver nor the command sender has a consumer.
         drop(rib_rx);
+        drop(control_tx);
     }
 
     // Build the shutdown future. `tokio::signal::ctrl_c()` returns a `!Unpin`

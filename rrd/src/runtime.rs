@@ -74,11 +74,25 @@ pub struct RibSnapshot {
 /// Wall-clock period between periodic structured status log lines.
 const STATUS_LOG_PERIOD: std::time::Duration = std::time::Duration::from_secs(5);
 
-/// Runtime command for destinations dynamically originated by this node.
-#[derive(Clone, Debug)]
-pub enum LocalOriginCommand {
-    Add { dest: RouterId, prefix: Prefix },
-    Remove { dest: RouterId },
+/// A read query answered from the (single-owner) engine inside the select loop.
+#[derive(Clone, Copy, Debug)]
+pub enum QueryMethod {
+    Status,
+    DumpRib,
+    Neighbors,
+}
+
+/// Runtime control command: mutate local origins, or answer a read query.
+/// Query results come back as a JSON value over a `oneshot` so the protocol
+/// boundary (`control.rs`) owns the JSON-RPC framing. Not `Clone`/`Debug`
+/// because `oneshot::Sender` is neither.
+pub enum ControlCommand {
+    AddLocalOrigin { dest: RouterId, prefix: Prefix },
+    RemoveLocalOrigin { dest: RouterId },
+    Query {
+        method: QueryMethod,
+        reply: tokio::sync::oneshot::Sender<serde_json::Value>,
+    },
 }
 
 /// The engine-driver daemon.  Generic over the transport so tests can use `MemTransport`.
@@ -93,8 +107,8 @@ pub struct Daemon<T: Transport> {
     addr_by_neighbor: HashMap<NeighborId, (u32, Ipv6Addr)>,
     next_nid: u32,
     rib_tx: watch::Sender<RibSnapshot>,
-    local_origin_rx: mpsc::UnboundedReceiver<LocalOriginCommand>,
-    local_origin_closed: bool,
+    control_rx: mpsc::UnboundedReceiver<ControlCommand>,
+    control_closed: bool,
     /// Cumulative datagrams handed to the daemon (decoded or not).
     datagrams_rx: u64,
     /// Cumulative wire-decode failures.
@@ -123,7 +137,7 @@ impl<T: Transport> Daemon<T> {
     /// The receiver stays live as long as the sender (held by the daemon) is alive,
     /// so it is valid across the `run` call even though `run` consumes `self`.
     pub fn new(cfg: DaemonConfig, transport: T) -> (Self, watch::Receiver<RibSnapshot>) {
-        let (daemon, rib_rx, _origin_tx) = Self::new_controlled(cfg, transport);
+        let (daemon, rib_rx, _control_tx) = Self::new_controlled(cfg, transport);
         (daemon, rib_rx)
     }
 
@@ -134,11 +148,11 @@ impl<T: Transport> Daemon<T> {
     ) -> (
         Self,
         watch::Receiver<RibSnapshot>,
-        mpsc::UnboundedSender<LocalOriginCommand>,
+        mpsc::UnboundedSender<ControlCommand>,
     ) {
         let engine = Engine::new(cfg.router_id.clone(), cfg.prefix, cfg.cfg, cfg.policy);
         let (rib_tx, rib_rx) = watch::channel(RibSnapshot::default());
-        let (local_origin_tx, local_origin_rx) = mpsc::unbounded_channel();
+        let (control_tx, control_rx) = mpsc::unbounded_channel();
 
         let daemon = Daemon {
             engine,
@@ -149,8 +163,8 @@ impl<T: Transport> Daemon<T> {
             addr_by_neighbor: HashMap::new(),
             next_nid: 0,
             rib_tx,
-            local_origin_rx,
-            local_origin_closed: false,
+            control_rx,
+            control_closed: false,
             datagrams_rx: 0,
             decode_errors: 0,
             fib_ops: Arc::new(AtomicU64::new(0)),
@@ -161,7 +175,7 @@ impl<T: Transport> Daemon<T> {
             neighbors_rejected: 0,
             last_intents: Vec::new(),
         };
-        (daemon, rib_rx, local_origin_tx)
+        (daemon, rib_rx, control_tx)
     }
 
     /// Current monotonic time fed to the engine: elapsed since the daemon started. Anchored at
@@ -289,22 +303,69 @@ impl<T: Transport> Daemon<T> {
         intents
     }
 
-    fn handle_local_origin_command(&mut self, cmd: LocalOriginCommand) {
-        match cmd {
-            LocalOriginCommand::Add { dest, prefix } => {
-                self.engine.add_local_origin(dest.clone(), prefix);
-                tracing::info!(
-                    dest = %dest.0,
-                    prefix = %format!("{}/{}", prefix.addr, prefix.len),
-                    "local origin added"
-                );
+    /// Answer a read query from current engine + daemon state as a JSON value
+    /// (an `rrd_proto` result type serialized once). Called with `&self` from the
+    /// select loop, so it sees a consistent in-loop snapshot with no locks.
+    fn handle_query(&self, method: QueryMethod) -> serde_json::Value {
+        let now = self.now();
+        match method {
+            QueryMethod::Status => {
+                let desired: Vec<DesiredRoute> = self.engine.desired_routes(now).collect();
+                let snap = self.build_snapshot_from(&desired);
+                let m = &snap.metrics;
+                serde_json::to_value(rrd_proto::StatusResult {
+                    proto_version: rrd_proto::PROTO_VERSION,
+                    dests: m.dests,
+                    neighbors: m.neighbors,
+                    routes: m.routes,
+                    datagrams_rx: m.datagrams_rx_total,
+                    decode_errors: m.decode_errors_total,
+                    fib_ops: m.fib_ops_total,
+                    fib_errors: m.fib_errors_total,
+                    neighbors_pruned: m.neighbors_pruned_total,
+                    neighbors_rejected: m.neighbors_rejected_total,
+                })
+                .unwrap_or(serde_json::Value::Null)
             }
-            LocalOriginCommand::Remove { dest } => {
-                if self.engine.remove_local_origin(&dest) {
-                    tracing::info!(dest = %dest.0, "local origin removed");
-                } else {
-                    tracing::debug!(dest = %dest.0, "local origin remove ignored");
-                }
+            QueryMethod::DumpRib => {
+                let entries: Vec<rrd_proto::RibEntryDto> = self
+                    .engine
+                    .desired_routes(now)
+                    .map(|dr| {
+                        let via = dr.nexthops.first().map(|h| h.via.0);
+                        let pot = self.engine.peek_pot(&dr.dest).unwrap_or(0.0);
+                        let vit = self
+                            .engine
+                            .route(now, &dr.dest)
+                            .map(|r| r.vit)
+                            .unwrap_or(0.0);
+                        let prefix = format!("{}/{}", dr.prefix.addr, dr.prefix.len);
+                        rrd_proto::RibEntryDto {
+                            dest: dr.dest.0,
+                            prefix,
+                            pot,
+                            vit,
+                            via,
+                            routable: dr.routable,
+                        }
+                    })
+                    .collect();
+                serde_json::to_value(rrd_proto::DumpRibResult { entries })
+                    .unwrap_or(serde_json::Value::Null)
+            }
+            QueryMethod::Neighbors => {
+                let mut neighbors: Vec<rrd_proto::NeighborDto> = self
+                    .addr_by_neighbor
+                    .iter()
+                    .map(|(nid, (iface, ip))| rrd_proto::NeighborDto {
+                        id: nid.0,
+                        iface: *iface,
+                        addr: ip.to_string(),
+                    })
+                    .collect();
+                neighbors.sort_by_key(|n| n.id);
+                serde_json::to_value(rrd_proto::NeighborsResult { neighbors })
+                    .unwrap_or(serde_json::Value::Null)
             }
         }
     }
@@ -527,10 +588,28 @@ impl<T: Transport> Daemon<T> {
                         }
                     }
                 }
-                cmd = self.local_origin_rx.recv(), if !self.local_origin_closed => {
+                cmd = self.control_rx.recv(), if !self.control_closed => {
                     match cmd {
-                        Some(cmd) => self.handle_local_origin_command(cmd),
-                        None => self.local_origin_closed = true,
+                        Some(ControlCommand::AddLocalOrigin { dest, prefix }) => {
+                            self.engine.add_local_origin(dest.clone(), prefix);
+                            tracing::info!(
+                                dest = %dest.0,
+                                prefix = %format!("{}/{}", prefix.addr, prefix.len),
+                                "local origin added"
+                            );
+                        }
+                        Some(ControlCommand::RemoveLocalOrigin { dest }) => {
+                            if self.engine.remove_local_origin(&dest) {
+                                tracing::info!(dest = %dest.0, "local origin removed");
+                            } else {
+                                tracing::debug!(dest = %dest.0, "local origin remove ignored");
+                            }
+                        }
+                        Some(ControlCommand::Query { method, reply }) => {
+                            let value = self.handle_query(method);
+                            let _ = reply.send(value);
+                        }
+                        None => self.control_closed = true,
                     }
                 }
                 ev = link_rx.recv(), if !link_closed => {
@@ -630,6 +709,20 @@ mod tests {
         // The initial snapshot is the default empty one.
         let snap = rx.borrow();
         assert!(snap.routable.is_empty());
+    }
+
+    #[tokio::test]
+    async fn query_status_returns_typed_result() {
+        let mut transports = MemBus::fully_connected(1);
+        let t = transports.remove(0);
+        let cfg = make_config("n0", "fd00::1".parse().unwrap(), 100);
+        let (daemon, _rx) = Daemon::new(cfg, t);
+        let value = daemon.handle_query(QueryMethod::Status);
+        let status: rrd_proto::StatusResult = serde_json::from_value(value).unwrap();
+        assert_eq!(status.proto_version, rrd_proto::PROTO_VERSION);
+        // A fresh engine tracks exactly its own self-origin (interned at slot 0).
+        assert_eq!(status.dests, 1);
+        assert_eq!(status.neighbors, 0);
     }
 
     fn intent(prefix_addr: &str, gateway: &str, oif: u32, weight: u8) -> RouteIntent {

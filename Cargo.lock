@@ -800,6 +800,7 @@ dependencies = [
  "nix 0.29.0",
  "ratatui",
  "ring-core",
+ "rrd-proto",
  "rtnetlink",
  "serde",
  "serde_json",
