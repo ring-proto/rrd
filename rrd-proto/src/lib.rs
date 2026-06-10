@@ -206,13 +206,15 @@ mod tests {
         );
         let v = serde_json::to_value(&resp).unwrap();
         assert!(v.get("result").is_none());
-        assert_eq!(v["error"]["code"], serde_json::json!(codes::METHOD_NOT_FOUND));
+        assert_eq!(
+            v["error"]["code"],
+            serde_json::json!(codes::METHOD_NOT_FOUND)
+        );
     }
 
     #[test]
     fn rejects_wrong_jsonrpc_version() {
-        let req: Request =
-            serde_json::from_str(r#"{"jsonrpc":"1.0","method":"status"}"#).unwrap();
+        let req: Request = serde_json::from_str(r#"{"jsonrpc":"1.0","method":"status"}"#).unwrap();
         assert!(!req.is_valid());
     }
 }

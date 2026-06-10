@@ -87,8 +87,13 @@ pub enum QueryMethod {
 /// boundary (`control.rs`) owns the JSON-RPC framing. Not `Clone`/`Debug`
 /// because `oneshot::Sender` is neither.
 pub enum ControlCommand {
-    AddLocalOrigin { dest: RouterId, prefix: Prefix },
-    RemoveLocalOrigin { dest: RouterId },
+    AddLocalOrigin {
+        dest: RouterId,
+        prefix: Prefix,
+    },
+    RemoveLocalOrigin {
+        dest: RouterId,
+    },
     Query {
         method: QueryMethod,
         reply: tokio::sync::oneshot::Sender<serde_json::Value>,

@@ -48,7 +48,11 @@ async fn status_returns_a_jsonrpc_result() {
     });
     tokio::time::sleep(Duration::from_millis(50)).await;
 
-    let req = Request::new(serde_json::json!(1), method::STATUS, serde_json::Value::Null);
+    let req = Request::new(
+        serde_json::json!(1),
+        method::STATUS,
+        serde_json::Value::Null,
+    );
     let resp = call(&path, &req).await.unwrap();
     assert!(resp.error.is_none(), "unexpected error: {:?}", resp.error);
     let status: StatusResult = serde_json::from_value(resp.result.unwrap()).unwrap();
