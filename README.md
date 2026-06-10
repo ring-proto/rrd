@@ -19,8 +19,9 @@ The protocol theory, proofs, and paper live in the sibling `ring/` repository.
 |---|---|
 | `ring-core` | Pure, I/O-free, deterministic RING field engine (the kernel). One dependency. |
 | `ring-sim` | Deterministic discrete-event simulation + invariant suite over `ring-core` (root-free). |
-| `rrd` | The async daemon: UDPv6 multicast transport, wire codec, rtnetlink FIB, control socket, link monitor — plus a `lab` subsystem for netns/veth topology orchestration and a TUI. |
-| `rrd-agent` | CNI lifecycle agent + `rrdctl` inspection CLI (CNI integration is currently parked). |
+| `rrd` | The async daemon (UDPv6 multicast transport, wire codec, rtnetlink FIB, JSON-RPC control socket, link monitor) plus the `rrdctl` CLI and a `lab` subsystem for netns/veth topology orchestration and a TUI. |
+| `rrd-proto` | Shared JSON-RPC 2.0 control protocol (dependency-light; used by the daemon and `rrdctl`). |
+| `rrd-agent` | CNI lifecycle agent (CNI integration is currently parked). |
 | `rrd-cni` | CNI plugin shim (parked). |
 
 The daemon is one node = one network namespace. Advertisements travel over an IPv6
@@ -48,6 +49,24 @@ rrd --router-id node-a \
     --max-paths 8 \
     --control-socket /run/rrd/control.sock
 ```
+
+## Control & introspection
+
+The daemon exposes a local **JSON-RPC 2.0** control socket (enable with
+`--control-socket`). Drive it with `rrdctl`:
+
+```sh
+rrdctl --control-socket /run/rrd/control.sock status
+rrdctl --control-socket /run/rrd/control.sock dump-rib
+rrdctl --control-socket /run/rrd/control.sock neighbors
+rrdctl --control-socket /run/rrd/control.sock add-origin pod:default/x fd00:abcd::/64
+rrdctl --control-socket /run/rrd/control.sock remove-origin pod:default/x
+```
+
+Mutating methods require the connecting peer to be the daemon's uid or root
+(`SO_PEERCRED`); the socket is created mode `0600`. The wire contract is the
+[`rrd-proto`](rrd-proto) crate (JSON-RPC 2.0, plain-string identities so external
+clients need no `ring-core` dependency); `status` reports `proto_version`.
 
 ## Proving behaviour
 
