@@ -14,7 +14,12 @@ pub enum Event {
     /// `link` is carried so [`crate::fabric::Fabric::do_deliver`] can drop an in-flight
     /// message whose link was cut while it was in transit (#29): a cut must take effect
     /// the instant it is applied, not one delivery later.
-    Deliver { to: usize, from: NeighborId, link: usize, msg: Message },
+    Deliver {
+        to: usize,
+        from: NeighborId,
+        link: usize,
+        msg: Message,
+    },
 }
 
 /// An event stamped with its fire time and an insertion sequence number (the tie-break).
@@ -117,7 +122,11 @@ mod tests {
                 order.push(node);
             }
         }
-        assert_eq!(order, vec![5, 6, 7], "same-time events keep insertion order");
+        assert_eq!(
+            order,
+            vec![5, 6, 7],
+            "same-time events keep insertion order"
+        );
     }
 
     #[test]

@@ -119,8 +119,7 @@ pub async fn query_status(path: impl AsRef<Path>) -> io::Result<StatusReply> {
                 let mut reader = BufReader::new(stream);
                 let mut line = String::new();
                 reader.read_line(&mut line).await?;
-                return serde_json::from_str::<StatusReply>(line.trim())
-                    .map_err(io::Error::other);
+                return serde_json::from_str::<StatusReply>(line.trim()).map_err(io::Error::other);
             }
             Err(error)
                 if matches!(

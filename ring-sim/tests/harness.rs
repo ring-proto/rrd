@@ -21,19 +21,29 @@ fn dead_destination_blackholes_then_severs() {
     let mut fab = Fabric::line(5, cfg, 7);
     fab.run_ticks(120);
     let mut rng = Rng::new(1);
-    assert_eq!(fab.forward(0, 4, 64, &mut rng, 0.0).outcome, Outcome::Delivered);
+    assert_eq!(
+        fab.forward(0, 4, 64, &mut rng, 0.0).outcome,
+        Outcome::Delivered
+    );
 
     fab.kill_node(4); // destination dies
     let immediate = fab.forward(0, 4, 64, &mut rng, 0.0);
     assert!(
-        matches!(immediate.outcome, Outcome::BlackholeDeadHop | Outcome::Severed),
+        matches!(
+            immediate.outcome,
+            Outcome::BlackholeDeadHop | Outcome::Severed
+        ),
         "right after death: a dead hop (or already severed), never delivered: {:?}",
         immediate.outcome
     );
 
     fab.run_ticks(600);
     let later = fab.forward(0, 4, 64, &mut rng, 0.0);
-    assert_eq!(later.outcome, Outcome::Severed, "vitality severs the dead destination");
+    assert_eq!(
+        later.outcome,
+        Outcome::Severed,
+        "vitality severs the dead destination"
+    );
 }
 
 #[test]

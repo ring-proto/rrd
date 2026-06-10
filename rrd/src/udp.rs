@@ -313,8 +313,7 @@ impl Transport for Udp6Transport {
     async fn send(&self, data: &[u8]) -> io::Result<()> {
         // Send to EVERY interface independently, collecting per-iface results.
         // One bad interface must not suppress emission on the healthy others.
-        let mut results: Vec<(u32, io::Result<usize>)> =
-            Vec::with_capacity(self.sockets.len());
+        let mut results: Vec<(u32, io::Result<usize>)> = Vec::with_capacity(self.sockets.len());
         for (ifindex, sock) in &self.sockets {
             let dest = SocketAddrV6::new(RING_GROUP, PORT, 0, *ifindex);
             let r = sock.send_to(data, dest).await;

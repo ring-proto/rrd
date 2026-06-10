@@ -27,7 +27,13 @@ pub struct LinkSpec {
 impl LinkSpec {
     /// A clean unit-conductance link with one-tick delay and no loss.
     pub fn clean(a: usize, b: usize) -> Self {
-        LinkSpec { a, b, g: 1.0, delay_ticks: 1.0, loss: 0.0 }
+        LinkSpec {
+            a,
+            b,
+            g: 1.0,
+            delay_ticks: 1.0,
+            loss: 0.0,
+        }
     }
 }
 
@@ -35,7 +41,7 @@ pub(crate) struct NodeState {
     pub engine: Engine,
     pub id: RouterId,
     pub clock_offset: Duration, // local_now(global) = clock_offset + rate*global (constant skew)
-    pub rate: f64,              // proper-time RATE multiplier: 1.0 = nominal; ≠1.0 models real drift
+    pub rate: f64, // proper-time RATE multiplier: 1.0 = nominal; ≠1.0 models real drift
     pub up: bool,
 }
 
@@ -75,7 +81,10 @@ fn node_prefix(i: usize) -> Prefix {
         "node index {i} overflows the IPv6 prefix hextet (max {} nodes); widen node_prefix encoding",
         0xffffusize
     );
-    Prefix { addr: Ipv6Addr::new(0xfd00, 0x7269, 0x6e67, (i + 1) as u16, 0, 0, 0, 0), len: 64 }
+    Prefix {
+        addr: Ipv6Addr::new(0xfd00, 0x7269, 0x6e67, (i + 1) as u16, 0, 0, 0, 0),
+        len: 64,
+    }
 }
 
 impl Fabric {
@@ -118,10 +127,12 @@ impl Fabric {
         let tick_nanos = cfg.tick.as_nanos() as i128;
 
         let mut nodes = Vec::with_capacity(n);
-        #[allow(clippy::needless_range_loop)] // `i` is used for format, prefix, link matching, and skew index
+        #[allow(clippy::needless_range_loop)]
+        // `i` is used for format, prefix, link matching, and skew index
         for i in 0..n {
             let id = RouterId::from(format!("n{i}").as_str());
-            let mut engine = Engine::new(id.clone(), node_prefix(i), cfg, ForwardingPolicy::default());
+            let mut engine =
+                Engine::new(id.clone(), node_prefix(i), cfg, ForwardingPolicy::default());
             for ls in links {
                 if ls.a == i {
                     engine.add_neighbor(NeighborId(ls.b as u32));
@@ -153,8 +164,14 @@ impl Fabric {
                 loss: ls.loss,
                 up: true,
             });
-            adj[ls.a].push(Adj { other: ls.b, link: li });
-            adj[ls.b].push(Adj { other: ls.a, link: li });
+            adj[ls.a].push(Adj {
+                other: ls.b,
+                link: li,
+            });
+            adj[ls.b].push(Adj {
+                other: ls.a,
+                link: li,
+            });
         }
 
         let mut fab = Fabric {
@@ -168,8 +185,10 @@ impl Fabric {
         };
         for node in 0..n {
             let phase = fab.rng.next_f64() * fab.cfg.tick.as_nanos() as f64;
-            fab.queue
-                .push(Duration::from_nanos(phase as u64), crate::event::Event::Emit { node });
+            fab.queue.push(
+                Duration::from_nanos(phase as u64),
+                crate::event::Event::Emit { node },
+            );
         }
         fab
     }
@@ -195,7 +214,10 @@ impl Fabric {
     ) -> Self {
         assert_eq!(rates.len(), n, "one rate per node");
         for (i, &r) in rates.iter().enumerate() {
-            assert!(r.is_finite() && r > 0.0, "node {i} rate {r} must be finite and > 0");
+            assert!(
+                r.is_finite() && r > 0.0,
+                "node {i} rate {r} must be finite and > 0"
+            );
         }
         let mut fab = Self::build(n, links, skews, cfg, seed);
         for (ns, &r) in fab.nodes.iter_mut().zip(rates) {
@@ -206,7 +228,9 @@ impl Fabric {
 
     /// A path graph 0-1-…-(n-1) of clean links.
     pub fn line(n: usize, cfg: Config, seed: u64) -> Self {
-        let links: Vec<LinkSpec> = (0..n.saturating_sub(1)).map(|i| LinkSpec::clean(i, i + 1)).collect();
+        let links: Vec<LinkSpec> = (0..n.saturating_sub(1))
+            .map(|i| LinkSpec::clean(i, i + 1))
+            .collect();
         Self::build_aligned(n, &links, cfg, seed)
     }
 
@@ -296,7 +320,12 @@ impl Fabric {
             // mis-attribute the message; the `build` guard prevents that (#37).
             self.queue.push(
                 at,
-                Event::Deliver { to, from: NeighborId(node as u32), link, msg: emit.clone() },
+                Event::Deliver {
+                    to,
+                    from: NeighborId(node as u32),
+                    link,
+                    msg: emit.clone(),
+                },
             );
         }
     }
@@ -341,7 +370,12 @@ impl Fabric {
             self.time = s.time;
             match s.event {
                 Event::Emit { node } => self.do_emit(node),
-                Event::Deliver { to, from, link, msg } => self.do_deliver(to, from, link, msg),
+                Event::Deliver {
+                    to,
+                    from,
+                    link,
+                    msg,
+                } => self.do_deliver(to, from, link, msg),
             }
         }
         self.time = end;
@@ -465,7 +499,13 @@ mod tests {
     #[should_panic(expected = "invalid conductance")]
     fn link_spec_g_zero_panics() {
         let cfg = Config::default();
-        let links = [LinkSpec { a: 0, b: 1, g: 0.0, delay_ticks: 1.0, loss: 0.0 }];
+        let links = [LinkSpec {
+            a: 0,
+            b: 1,
+            g: 0.0,
+            delay_ticks: 1.0,
+            loss: 0.0,
+        }];
         let _fab = Fabric::build_aligned(2, &links, cfg, 1);
     }
 
@@ -473,7 +513,13 @@ mod tests {
     #[should_panic(expected = "invalid conductance")]
     fn link_spec_g_negative_panics() {
         let cfg = Config::default();
-        let links = [LinkSpec { a: 0, b: 1, g: -1.0, delay_ticks: 1.0, loss: 0.0 }];
+        let links = [LinkSpec {
+            a: 0,
+            b: 1,
+            g: -1.0,
+            delay_ticks: 1.0,
+            loss: 0.0,
+        }];
         let _fab = Fabric::build_aligned(2, &links, cfg, 1);
     }
 
@@ -481,14 +527,26 @@ mod tests {
     #[should_panic(expected = "invalid conductance")]
     fn link_spec_g_nan_panics() {
         let cfg = Config::default();
-        let links = [LinkSpec { a: 0, b: 1, g: f64::NAN, delay_ticks: 1.0, loss: 0.0 }];
+        let links = [LinkSpec {
+            a: 0,
+            b: 1,
+            g: f64::NAN,
+            delay_ticks: 1.0,
+            loss: 0.0,
+        }];
         let _fab = Fabric::build_aligned(2, &links, cfg, 1);
     }
 
     #[test]
     fn link_spec_g_positive_works() {
         let cfg = Config::default();
-        let links = [LinkSpec { a: 0, b: 1, g: 2.5, delay_ticks: 1.0, loss: 0.0 }];
+        let links = [LinkSpec {
+            a: 0,
+            b: 1,
+            g: 2.5,
+            delay_ticks: 1.0,
+            loss: 0.0,
+        }];
         let fab = Fabric::build_aligned(2, &links, cfg, 1);
         assert_eq!(fab.n(), 2);
     }
@@ -539,7 +597,10 @@ mod tests {
         let mut fab = Fabric::line(2, cfg, 7);
         fab.run_ticks(120);
         let dst1 = fab.nodes[1].id.clone();
-        assert!(fab.is_routable(0, 1), "0 should have learned 1 before the cut");
+        assert!(
+            fab.is_routable(0, 1),
+            "0 should have learned 1 before the cut"
+        );
 
         // Capture a message node 1 emits right now: this is the frame that will be "in flight".
         let now1 = fab.local(1);
@@ -557,11 +618,19 @@ mod tests {
         let at = fab.time + Duration::from_nanos(1);
         fab.queue.push(
             at,
-            Event::Deliver { to: 0, from: NeighborId(1), link, msg: in_flight },
+            Event::Deliver {
+                to: 0,
+                from: NeighborId(1),
+                link,
+                msg: in_flight,
+            },
         );
         fab.run_until(at);
 
-        let vit_after = fab.nodes[0].engine.peek_vit(&dst1).expect("0 still knows dest 1");
+        let vit_after = fab.nodes[0]
+            .engine
+            .peek_vit(&dst1)
+            .expect("0 still knows dest 1");
         // Allow a hair of aging slack; assert NO upward bump (the dropped message must not refresh).
         assert!(
             vit_after <= vit_before + 1e-12,

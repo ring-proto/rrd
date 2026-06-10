@@ -114,8 +114,14 @@ fn churn_disturbs_then_resettles_with_no_persistent_loop() {
     // A freshly converged grid: every live pair delivers, nothing disturbed, no loop.
     let base = probe(&fab, &[]);
     assert_eq!(base.loops, 0, "converged grid must be loop-free");
-    assert!(!base.disturbed(), "converged grid must have no disturbed forwards");
-    assert_eq!(base.delivered, base.live_pairs, "converged grid: every pair delivers");
+    assert!(
+        !base.disturbed(),
+        "converged grid must have no disturbed forwards"
+    );
+    assert_eq!(
+        base.delivered, base.live_pairs,
+        "converged grid: every pair delivers"
+    );
     assert_eq!(base.live_pairs, 72, "3x3 grid has 72 ordered pairs");
 
     // Churn schedule. After EACH disruption we probe several mid-reconvergence instants, then fully
@@ -125,8 +131,16 @@ fn churn_disturbs_then_resettles_with_no_persistent_loop() {
     type Disrupt = Box<dyn Fn(&mut Fabric)>;
     // Each step: a label, the disruption, and the set of nodes dead AFTER it is applied.
     let disruptions: Vec<(&str, Disrupt, Vec<usize>)> = vec![
-        ("kill centre 4", Box::new(|f: &mut Fabric| f.kill_node(4)), vec![4]),
-        ("revive centre 4", Box::new(|f: &mut Fabric| f.revive_node(4)), vec![]),
+        (
+            "kill centre 4",
+            Box::new(|f: &mut Fabric| f.kill_node(4)),
+            vec![4],
+        ),
+        (
+            "revive centre 4",
+            Box::new(|f: &mut Fabric| f.revive_node(4)),
+            vec![],
+        ),
         (
             "cut edge 1-4",
             Box::new(move |f: &mut Fabric| {

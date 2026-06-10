@@ -19,7 +19,10 @@ pub enum Outcome {
 
 impl Outcome {
     pub fn blackholed(self) -> bool {
-        matches!(self, Outcome::BlackholeDeadHop | Outcome::BlackholeLoop | Outcome::BlackholeTtl)
+        matches!(
+            self,
+            Outcome::BlackholeDeadHop | Outcome::BlackholeLoop | Outcome::BlackholeTtl
+        )
     }
 }
 
@@ -44,13 +47,22 @@ enum Hop {
 impl Fabric {
     /// Inject one packet at `src` toward `dst`, walking the current routing snapshot. `hop_loss`
     /// is an optional per-hop physical drop probability (driven by `rng`); pass 0.0 for lossless.
-    pub fn forward(&self, src: usize, dst: usize, ttl: usize, rng: &mut Rng, hop_loss: f64) -> Delivery {
-        self.forward_walk(src, dst, ttl, rng, hop_loss, |cur| match self.route(cur, dst) {
-            Some(r) if r.routable => match r.via {
-                Some(NeighborId(j)) => Hop::To(j as usize),
-                None => Hop::Severed,
-            },
-            _ => Hop::Severed,
+    pub fn forward(
+        &self,
+        src: usize,
+        dst: usize,
+        ttl: usize,
+        rng: &mut Rng,
+        hop_loss: f64,
+    ) -> Delivery {
+        self.forward_walk(src, dst, ttl, rng, hop_loss, |cur| {
+            match self.route(cur, dst) {
+                Some(r) if r.routable => match r.via {
+                    Some(NeighborId(j)) => Hop::To(j as usize),
+                    None => Hop::Severed,
+                },
+                _ => Hop::Severed,
+            }
         })
     }
 
@@ -75,28 +87,54 @@ impl Fabric {
         let mut hops = 0usize;
         loop {
             if !self.node_up(cur) {
-                return Delivery { outcome: Outcome::BlackholeDeadHop, hops, path };
+                return Delivery {
+                    outcome: Outcome::BlackholeDeadHop,
+                    hops,
+                    path,
+                };
             }
             if cur == dst {
-                return Delivery { outcome: Outcome::Delivered, hops, path };
+                return Delivery {
+                    outcome: Outcome::Delivered,
+                    hops,
+                    path,
+                };
             }
             if hops >= ttl {
-                return Delivery { outcome: Outcome::BlackholeTtl, hops, path };
+                return Delivery {
+                    outcome: Outcome::BlackholeTtl,
+                    hops,
+                    path,
+                };
             }
             match next_hop(cur) {
                 Hop::To(via) => {
                     if rng.chance(hop_loss) {
-                        return Delivery { outcome: Outcome::Lost, hops, path };
+                        return Delivery {
+                            outcome: Outcome::Lost,
+                            hops,
+                            path,
+                        };
                     }
                     if visited.contains(&via) {
-                        return Delivery { outcome: Outcome::BlackholeLoop, hops, path };
+                        return Delivery {
+                            outcome: Outcome::BlackholeLoop,
+                            hops,
+                            path,
+                        };
                     }
                     visited.insert(via);
                     path.push(via);
                     hops += 1;
                     cur = via;
                 }
-                Hop::Severed => return Delivery { outcome: Outcome::Severed, hops, path },
+                Hop::Severed => {
+                    return Delivery {
+                        outcome: Outcome::Severed,
+                        hops,
+                        path,
+                    }
+                }
             }
         }
     }
@@ -129,9 +167,17 @@ mod tests {
             1 => Hop::To(0),
             _ => Hop::Severed,
         });
-        assert_eq!(del.outcome, Outcome::BlackholeLoop, "a via-cycle must be detected as a loop");
+        assert_eq!(
+            del.outcome,
+            Outcome::BlackholeLoop,
+            "a via-cycle must be detected as a loop"
+        );
         // The loop is caught the instant a node is revisited, well before the hop budget.
-        assert!(del.hops < 64, "loop detected promptly, not via TTL exhaustion: hops={}", del.hops);
+        assert!(
+            del.hops < 64,
+            "loop detected promptly, not via TTL exhaustion: hops={}",
+            del.hops
+        );
     }
 
     /// Companion sanity: the same walk with an ACYCLIC oracle that reaches the dest delivers, so the

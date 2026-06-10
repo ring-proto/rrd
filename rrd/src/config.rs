@@ -152,10 +152,7 @@ impl DaemonConfig {
         }
         if let Some(a) = cli.alpha {
             if !a.is_finite() || a <= 0.0 {
-                return Err(format!(
-                    "alpha must be finite and > 0 (got {})",
-                    a
-                ));
+                return Err(format!("alpha must be finite and > 0 (got {})", a));
             }
             cfg.alpha = a;
         }
@@ -346,7 +343,10 @@ mod tests {
 
     #[test]
     fn kappa_zero_is_rejected() {
-        let cli = Cli { kappa: Some(0.0), ..base_cli() };
+        let cli = Cli {
+            kappa: Some(0.0),
+            ..base_cli()
+        };
         assert!(
             DaemonConfig::from_cli(&cli).is_err(),
             "kappa=0 must be rejected"
@@ -355,7 +355,10 @@ mod tests {
 
     #[test]
     fn kappa_negative_is_rejected() {
-        let cli = Cli { kappa: Some(-1.0), ..base_cli() };
+        let cli = Cli {
+            kappa: Some(-1.0),
+            ..base_cli()
+        };
         assert!(
             DaemonConfig::from_cli(&cli).is_err(),
             "kappa=-1 must be rejected"
@@ -364,7 +367,10 @@ mod tests {
 
     #[test]
     fn kappa_nan_is_rejected() {
-        let cli = Cli { kappa: Some(f64::NAN), ..base_cli() };
+        let cli = Cli {
+            kappa: Some(f64::NAN),
+            ..base_cli()
+        };
         assert!(
             DaemonConfig::from_cli(&cli).is_err(),
             "kappa=NaN must be rejected"
@@ -373,7 +379,10 @@ mod tests {
 
     #[test]
     fn kappa_inf_is_rejected() {
-        let cli = Cli { kappa: Some(f64::INFINITY), ..base_cli() };
+        let cli = Cli {
+            kappa: Some(f64::INFINITY),
+            ..base_cli()
+        };
         assert!(
             DaemonConfig::from_cli(&cli).is_err(),
             "kappa=Inf must be rejected"
@@ -382,7 +391,10 @@ mod tests {
 
     #[test]
     fn kappa_positive_is_accepted() {
-        let cli = Cli { kappa: Some(0.05), ..base_cli() };
+        let cli = Cli {
+            kappa: Some(0.05),
+            ..base_cli()
+        };
         let dc = DaemonConfig::from_cli(&cli).expect("kappa=0.05 must be accepted");
         assert!((dc.cfg.kappa - 0.05).abs() < 1e-12);
     }
@@ -392,7 +404,10 @@ mod tests {
     #[test]
     fn router_id_255_bytes_is_accepted() {
         let id = "x".repeat(255);
-        let cli = Cli { router_id: id.clone(), ..base_cli() };
+        let cli = Cli {
+            router_id: id.clone(),
+            ..base_cli()
+        };
         let dc = DaemonConfig::from_cli(&cli).expect("255-byte router-id must be accepted");
         assert_eq!(dc.router_id.0, id);
     }
@@ -400,7 +415,10 @@ mod tests {
     #[test]
     fn router_id_256_bytes_is_rejected() {
         let id = "x".repeat(256);
-        let cli = Cli { router_id: id, ..base_cli() };
+        let cli = Cli {
+            router_id: id,
+            ..base_cli()
+        };
         assert!(
             DaemonConfig::from_cli(&cli).is_err(),
             "256-byte router-id must be rejected"
@@ -410,7 +428,10 @@ mod tests {
     #[test]
     fn router_id_300_bytes_is_rejected() {
         let id = "a".repeat(300);
-        let cli = Cli { router_id: id, ..base_cli() };
+        let cli = Cli {
+            router_id: id,
+            ..base_cli()
+        };
         assert!(
             DaemonConfig::from_cli(&cli).is_err(),
             "300-byte router-id must be rejected"

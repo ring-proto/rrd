@@ -42,11 +42,7 @@ async fn main() -> anyhow::Result<()> {
     if let Some(socket) = args.rrd_control_socket {
         config = config.with_rrd_control_socket(socket);
     }
-    run_agent(
-        config,
-        shutdown_rx,
-    )
-    .await?;
+    run_agent(config, shutdown_rx).await?;
     tracing::info!("rrd-agent stopped");
     Ok(())
 }

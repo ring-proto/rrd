@@ -10,11 +10,22 @@ fn line_converges_all_pairs_routable_and_delivering() {
     let mut rng = Rng::new(1);
     for s in 0..n {
         for d in 0..n {
-            if s == d { continue; }
+            if s == d {
+                continue;
+            }
             assert!(fab.is_routable(s, d), "{s}->{d} should be routable");
             let del = fab.forward(s, d, 64, &mut rng, 0.0);
-            assert_eq!(del.outcome, Outcome::Delivered, "{s}->{d} {:?}", del.outcome);
-            assert_eq!(del.hops, (s as isize - d as isize).unsigned_abs(), "{s}->{d} stretch-1");
+            assert_eq!(
+                del.outcome,
+                Outcome::Delivered,
+                "{s}->{d} {:?}",
+                del.outcome
+            );
+            assert_eq!(
+                del.hops,
+                (s as isize - d as isize).unsigned_abs(),
+                "{s}->{d} stretch-1"
+            );
         }
     }
 }
@@ -35,9 +46,17 @@ fn default_config_routes_a_five_hop_line() {
             if s == d {
                 continue;
             }
-            assert!(fab.is_routable(s, d), "default cfg: {s}->{d} should be routable");
+            assert!(
+                fab.is_routable(s, d),
+                "default cfg: {s}->{d} should be routable"
+            );
             let del = fab.forward(s, d, 64, &mut rng, 0.0);
-            assert_eq!(del.outcome, Outcome::Delivered, "{s}->{d} {:?}", del.outcome);
+            assert_eq!(
+                del.outcome,
+                Outcome::Delivered,
+                "{s}->{d} {:?}",
+                del.outcome
+            );
             assert_eq!(
                 del.hops,
                 (s as isize - d as isize).unsigned_abs(),

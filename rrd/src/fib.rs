@@ -341,7 +341,11 @@ mod tests {
     fn emergency_flush_argv_flushes_ring_proto_when_routes_present() {
         let argv = emergency_flush_argv(3).expect("a non-empty install yields a flush argv");
         assert_eq!(argv, vec!["-6", "route", "flush", "proto", "155"]);
-        assert_eq!(argv[4], RING_PROTO.to_string(), "flushes exactly our proto tag");
+        assert_eq!(
+            argv[4],
+            RING_PROTO.to_string(),
+            "flushes exactly our proto tag"
+        );
     }
 
     #[test]

@@ -180,7 +180,10 @@ pub fn encode_segments(msg: &Message, max_bytes: usize) -> Vec<Vec<u8>> {
 }
 
 fn encode_str(buf: &mut Vec<u8>, s: &str) {
-    debug_assert!(s.len() <= 255, "encode_str: string exceeds 255 bytes, will be silently truncated");
+    debug_assert!(
+        s.len() <= 255,
+        "encode_str: string exceeds 255 bytes, will be silently truncated"
+    );
     let bytes = s.as_bytes();
     let len = bytes.len().min(255) as u8;
     buf.push(len);
@@ -711,7 +714,7 @@ mod tests {
         buf.extend_from_slice(b"RING"); // magic
         buf.push(1u8); // version
         buf.push(0u8); // flags
-        // from: "n" (1 byte len + 1 byte content)
+                       // from: "n" (1 byte len + 1 byte content)
         buf.push(1u8);
         buf.push(b'n');
         // hears: 0
@@ -757,12 +760,18 @@ mod tests {
             hears: vec![],
             delta: vec![Entry {
                 dest: router_id("d"),
-                prefix: Prefix { addr: Ipv6Addr::UNSPECIFIED, len: 64 },
+                prefix: Prefix {
+                    addr: Ipv6Addr::UNSPECIFIED,
+                    len: 64,
+                },
                 pot: 0.5,
                 vit: 0.5,
             }],
         };
-        assert!(decode(&encode(&msg)).is_ok(), "single entry must parse fine");
+        assert!(
+            decode(&encode(&msg)).is_ok(),
+            "single entry must parse fine"
+        );
     }
 
     #[test]
@@ -782,7 +791,10 @@ mod tests {
     fn entry(i: usize) -> Entry {
         Entry {
             dest: router_id(&format!("router-{i}")),
-            prefix: Prefix { addr: Ipv6Addr::UNSPECIFIED, len: 64 },
+            prefix: Prefix {
+                addr: Ipv6Addr::UNSPECIFIED,
+                len: 64,
+            },
             pot: (i as f64) * 0.001,
             vit: 0.5,
         }
@@ -839,13 +851,22 @@ mod tests {
 
         let mut reassembled: Vec<Entry> = Vec::new();
         for f in &frames {
-            assert!(f.len() <= max, "frame of {} bytes exceeds budget {}", f.len(), max);
+            assert!(
+                f.len() <= max,
+                "frame of {} bytes exceeds budget {}",
+                f.len(),
+                max
+            );
             let d = decode(f).expect("each segment decodes independently");
             assert_eq!(d.from, msg.from, "from preserved in every segment");
             assert_eq!(d.hears, msg.hears, "hears preserved in every segment");
             reassembled.extend(d.delta);
         }
-        assert_eq!(reassembled.len(), delta.len(), "no entry lost or duplicated");
+        assert_eq!(
+            reassembled.len(),
+            delta.len(),
+            "no entry lost or duplicated"
+        );
         for (got, want) in reassembled.iter().zip(delta.iter()) {
             assert_eq!(got.dest, want.dest, "order + identity preserved");
             assert_eq!(got.prefix.len, want.prefix.len);
@@ -863,10 +884,18 @@ mod tests {
             delta: vec![entry(1), entry(2), entry(3)],
         };
         let frames = encode_segments(&msg, 8); // smaller than the header alone
-        assert_eq!(frames.len(), 3, "each entry forced into its own (over-budget) frame");
+        assert_eq!(
+            frames.len(),
+            3,
+            "each entry forced into its own (over-budget) frame"
+        );
         let mut all = Vec::new();
         for f in &frames {
-            all.extend(decode(f).expect("over-budget frame is still a valid frame").delta);
+            all.extend(
+                decode(f)
+                    .expect("over-budget frame is still a valid frame")
+                    .delta,
+            );
         }
         assert_eq!(all.len(), 3, "all entries survive best-effort segmentation");
     }
@@ -875,9 +904,17 @@ mod tests {
     fn encode_segments_default_payload_frames_fit_min_ipv6_mtu() {
         // At the default budget, every frame fits the IPv6 minimum MTU (1280 − 48 headers).
         let delta: Vec<Entry> = (0..500).map(entry).collect();
-        let msg = Message { from: router_id("n"), hears: vec![], delta };
+        let msg = Message {
+            from: router_id("n"),
+            hears: vec![],
+            delta,
+        };
         for f in encode_segments(&msg, MAX_SEGMENT_PAYLOAD) {
-            assert!(f.len() <= 1232, "frame {} > 1232-byte non-fragmenting payload", f.len());
+            assert!(
+                f.len() <= 1232,
+                "frame {} > 1232-byte non-fragmenting payload",
+                f.len()
+            );
         }
     }
 }

@@ -97,6 +97,10 @@ mod tests {
         let mut a = Rng::new(5);
         assert!(!a.chance(f64::NAN));
         let mut b = Rng::new(5);
-        assert_eq!(a.next_u64(), b.next_u64(), "NaN must not advance the stream");
+        assert_eq!(
+            a.next_u64(),
+            b.next_u64(),
+            "NaN must not advance the stream"
+        );
     }
 }

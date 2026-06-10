@@ -1,7 +1,9 @@
 use ring_sim::{multihop_cfg, Fabric};
 
 fn line_links(n: usize) -> Vec<ring_sim::LinkSpec> {
-    (0..n - 1).map(|i| ring_sim::LinkSpec::clean(i, i + 1)).collect()
+    (0..n - 1)
+        .map(|i| ring_sim::LinkSpec::clean(i, i + 1))
+        .collect()
 }
 
 /// #12 (was a tautology): the original test took same-clock diffs of a SINGLE skewed run, where a
@@ -22,8 +24,8 @@ fn clock_free_converges_and_severs_under_real_drift() {
     let n = 5;
     let links = line_links(n);
     let skews = [-15i64, 11, -9, 14, -12]; // constant skew on TOP of the drift
-    // Per-node rate drift: each node's proper time runs slightly fast or slow. Mixed signs so the
-    // fastest and slowest nodes pull apart over the run (no global rate to factor out).
+                                           // Per-node rate drift: each node's proper time runs slightly fast or slow. Mixed signs so the
+                                           // fastest and slowest nodes pull apart over the run (no global rate to factor out).
     let rates = [1.02, 0.98, 1.015, 0.985, 1.0];
 
     let reps = 12;
@@ -41,8 +43,14 @@ fn clock_free_converges_and_severs_under_real_drift() {
             severed += 1;
         }
     }
-    assert_eq!(converged, reps, "must converge under real per-node clock DRIFT in 100% of reps");
-    assert_eq!(severed, reps, "must sever a dead source under real DRIFT in 100% of reps");
+    assert_eq!(
+        converged, reps,
+        "must converge under real per-node clock DRIFT in 100% of reps"
+    );
+    assert_eq!(
+        severed, reps,
+        "must sever a dead source under real DRIFT in 100% of reps"
+    );
 }
 
 /// Guard B — constant skew is provably invisible (the clock-free invariant), stated as a
@@ -84,7 +92,10 @@ fn constant_skew_matches_unskewed_outcomes() {
         let unskewed = trace(&zero, seed);
         // The reference must be non-trivial: it converges (some true early) and severs (all false
         // at the end), so neither trace is vacuously all-equal.
-        assert!(skewed.iter().any(|&b| b), "seed {seed}: reference never became routable");
+        assert!(
+            skewed.iter().any(|&b| b),
+            "seed {seed}: reference never became routable"
+        );
         let n_surv = n - 1;
         assert!(
             skewed[skewed.len() - n_surv..].iter().all(|&b| !b),

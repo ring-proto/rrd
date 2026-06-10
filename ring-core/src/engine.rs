@@ -62,7 +62,10 @@ pub struct Engine {
 
 impl Engine {
     pub fn new(id: RouterId, prefix: Prefix, cfg: Config, policy: ForwardingPolicy) -> Self {
-        debug_assert!(cfg.kappa > 0.0, "kappa must be > 0 for the screened M-matrix");
+        debug_assert!(
+            cfg.kappa > 0.0,
+            "kappa must be > 0 for the screened M-matrix"
+        );
         let mut e = Engine {
             id: id.clone(),
             cfg,
@@ -1023,7 +1026,10 @@ mod tests {
         assert_eq!(a.neighbor_count(), 2, "refused neighbour is never inserted");
         assert!(!a.has_neighbor(NeighborId(3)));
         // An already-present neighbour is idempotently accepted even at the cap.
-        assert!(a.add_neighbor(NeighborId(1)), "known neighbour is idempotent at the cap");
+        assert!(
+            a.add_neighbor(NeighborId(1)),
+            "known neighbour is idempotent at the cap"
+        );
         assert_eq!(a.neighbor_count(), 2, "idempotent re-add does not grow");
     }
 
@@ -1036,7 +1042,10 @@ mod tests {
             ..Default::default()
         };
         let mut a = Engine::new(RouterId::from("a"), px(1), cfg, Default::default());
-        assert!(!a.add_neighbor(NeighborId(1)), "zero cap refuses all neighbours");
+        assert!(
+            !a.add_neighbor(NeighborId(1)),
+            "zero cap refuses all neighbours"
+        );
         assert_eq!(a.neighbor_count(), 0);
     }
 
@@ -1128,9 +1137,24 @@ mod tests {
             from: RouterId::from("n1"),
             hears: vec![RouterId::from("a")],
             delta: vec![
-                Entry { dest: RouterId::from("b"), prefix: px(11), pot: 0.90, vit: 1.0 },
-                Entry { dest: RouterId::from("c"), prefix: px(22), pot: 0.50, vit: 1.0 },
-                Entry { dest: RouterId::from("d"), prefix: px(33), pot: 0.70, vit: 1.0 },
+                Entry {
+                    dest: RouterId::from("b"),
+                    prefix: px(11),
+                    pot: 0.90,
+                    vit: 1.0,
+                },
+                Entry {
+                    dest: RouterId::from("c"),
+                    prefix: px(22),
+                    pot: 0.50,
+                    vit: 1.0,
+                },
+                Entry {
+                    dest: RouterId::from("d"),
+                    prefix: px(33),
+                    pot: 0.70,
+                    vit: 1.0,
+                },
             ],
         };
         // Drive all three to a fixed point.
@@ -1157,9 +1181,24 @@ mod tests {
             from: RouterId::from("n1"),
             hears: vec![RouterId::from("a")],
             delta: vec![
-                Entry { dest: RouterId::from("b"), prefix: px(11), pot: 0.90, vit: 1.0 },
-                Entry { dest: RouterId::from("c"), prefix: px(22), pot: 0.0, vit: 0.0 },
-                Entry { dest: RouterId::from("d"), prefix: px(33), pot: 0.70, vit: 1.0 },
+                Entry {
+                    dest: RouterId::from("b"),
+                    prefix: px(11),
+                    pot: 0.90,
+                    vit: 1.0,
+                },
+                Entry {
+                    dest: RouterId::from("c"),
+                    prefix: px(22),
+                    pot: 0.0,
+                    vit: 0.0,
+                },
+                Entry {
+                    dest: RouterId::from("d"),
+                    prefix: px(33),
+                    pot: 0.70,
+                    vit: 1.0,
+                },
             ],
         };
         for k in 40..70u32 {
@@ -1174,8 +1213,18 @@ mod tests {
             from: RouterId::from("n1"),
             hears: vec![RouterId::from("a")],
             delta: vec![
-                Entry { dest: RouterId::from("b"), prefix: px(11), pot: 0.90, vit: 1.0 },
-                Entry { dest: RouterId::from("d"), prefix: px(33), pot: 0.70, vit: 1.0 },
+                Entry {
+                    dest: RouterId::from("b"),
+                    prefix: px(11),
+                    pot: 0.90,
+                    vit: 1.0,
+                },
+                Entry {
+                    dest: RouterId::from("d"),
+                    prefix: px(33),
+                    pot: 0.70,
+                    vit: 1.0,
+                },
             ],
         };
         for k in 70..200u32 {
@@ -1205,8 +1254,14 @@ mod tests {
         assert_eq!(a.route(now1, &RouterId::from("d")).unwrap().via, d_via);
         // Prefixes still resolve to the RIGHT dest (no slot bleed from the evicted middle).
         let routes: Vec<_> = a.desired_routes(now1).collect();
-        assert!(routes.iter().any(|r| r.prefix == px(11)), "b prefix present");
-        assert!(routes.iter().any(|r| r.prefix == px(33)), "d prefix present");
+        assert!(
+            routes.iter().any(|r| r.prefix == px(11)),
+            "b prefix present"
+        );
+        assert!(
+            routes.iter().any(|r| r.prefix == px(33)),
+            "d prefix present"
+        );
         assert!(
             routes.iter().all(|r| r.prefix != px(22)),
             "evicted c's prefix must be gone"
@@ -1233,8 +1288,8 @@ mod tests {
         // Set a valid g first, then try to corrupt it with 0.
         e.set_neighbor_conductance(NeighborId(1), 3.0);
         e.set_neighbor_conductance(NeighborId(1), 0.0); // must be no-op
-        // Verify: ingest a message with hears=[a] and step; the field should
-        // reflect g=3.0 not g=0.0 (if it were 0 the field would compute to 0).
+                                                        // Verify: ingest a message with hears=[a] and step; the field should
+                                                        // reflect g=3.0 not g=0.0 (if it were 0 the field would compute to 0).
         let msg = Message {
             from: RouterId::from("n1"),
             hears: vec![RouterId::from("a")],
@@ -1264,13 +1319,21 @@ mod tests {
         let msg = Message {
             from: RouterId::from("n1"),
             hears: vec![RouterId::from("a")],
-            delta: vec![Entry { dest: RouterId::from("b"), prefix: px(2), pot: cfg.f0, vit: 1.0 }],
+            delta: vec![Entry {
+                dest: RouterId::from("b"),
+                prefix: px(2),
+                pot: cfg.f0,
+                vit: 1.0,
+            }],
         };
         for k in 0..5u32 {
             e.ingest(cfg.tick * k, NeighborId(1), &msg);
             e.step(cfg.tick * k);
         }
-        assert!(e.peek_pot(&RouterId::from("b")).unwrap() > 0.0, "g=-1 must not corrupt conductance");
+        assert!(
+            e.peek_pot(&RouterId::from("b")).unwrap() > 0.0,
+            "g=-1 must not corrupt conductance"
+        );
     }
 
     #[test]
@@ -1283,13 +1346,21 @@ mod tests {
         let msg = Message {
             from: RouterId::from("n1"),
             hears: vec![RouterId::from("a")],
-            delta: vec![Entry { dest: RouterId::from("b"), prefix: px(2), pot: cfg.f0, vit: 1.0 }],
+            delta: vec![Entry {
+                dest: RouterId::from("b"),
+                prefix: px(2),
+                pot: cfg.f0,
+                vit: 1.0,
+            }],
         };
         for k in 0..5u32 {
             e.ingest(cfg.tick * k, NeighborId(1), &msg);
             e.step(cfg.tick * k);
         }
-        assert!(e.peek_pot(&RouterId::from("b")).unwrap() > 0.0, "g=NaN must not corrupt conductance");
+        assert!(
+            e.peek_pot(&RouterId::from("b")).unwrap() > 0.0,
+            "g=NaN must not corrupt conductance"
+        );
     }
 
     #[test]
@@ -1302,13 +1373,21 @@ mod tests {
         let msg = Message {
             from: RouterId::from("n1"),
             hears: vec![RouterId::from("a")],
-            delta: vec![Entry { dest: RouterId::from("b"), prefix: px(2), pot: cfg.f0, vit: 1.0 }],
+            delta: vec![Entry {
+                dest: RouterId::from("b"),
+                prefix: px(2),
+                pot: cfg.f0,
+                vit: 1.0,
+            }],
         };
         for k in 0..5u32 {
             e.ingest(cfg.tick * k, NeighborId(1), &msg);
             e.step(cfg.tick * k);
         }
-        assert!(e.peek_pot(&RouterId::from("b")).unwrap() > 0.0, "g=Inf must not corrupt conductance");
+        assert!(
+            e.peek_pot(&RouterId::from("b")).unwrap() > 0.0,
+            "g=Inf must not corrupt conductance"
+        );
     }
 
     #[test]
@@ -1320,7 +1399,12 @@ mod tests {
         let msg = Message {
             from: RouterId::from("n1"),
             hears: vec![RouterId::from("a")],
-            delta: vec![Entry { dest: RouterId::from("b"), prefix: px(2), pot: cfg.f0, vit: 1.0 }],
+            delta: vec![Entry {
+                dest: RouterId::from("b"),
+                prefix: px(2),
+                pot: cfg.f0,
+                vit: 1.0,
+            }],
         };
         for k in 0..5u32 {
             e.ingest(cfg.tick * k, NeighborId(1), &msg);
@@ -1405,7 +1489,11 @@ mod tests {
 
         // Jump far past the floor horizon AND the dwell: the peer is pruned.
         let out = a.step(base + cfg.tick * 200_000);
-        assert_eq!(a.neighbor_count(), 0, "silent peer past the floor is reclaimed");
+        assert_eq!(
+            a.neighbor_count(),
+            0,
+            "silent peer past the floor is reclaimed"
+        );
         assert!(
             out.pruned.contains(&NeighborId(1)),
             "the pruned id is reported to the driver: {:?}",
@@ -1471,7 +1559,11 @@ mod tests {
             a.ingest(now, NeighborId(1), &msg);
             a.step(now);
         }
-        assert_eq!(a.neighbor_count(), 1, "neighbour is back after re-admission");
+        assert_eq!(
+            a.neighbor_count(),
+            1,
+            "neighbour is back after re-admission"
+        );
         let route = a
             .route(resume + cfg.tick * 5, &RouterId::from("b"))
             .expect("b is interned again");

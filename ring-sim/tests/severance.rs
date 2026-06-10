@@ -28,7 +28,10 @@ fn severance_tick(no_retard: bool, seed: u64, cap: u64) -> Option<u64> {
     let n = 5;
     let mut fab = Fabric::line(n, cfg, seed);
     fab.run_ticks(300); // converge toward source 0
-    assert!((1..n).all(|d| fab.is_routable(d, 0)), "must converge before the kill");
+    assert!(
+        (1..n).all(|d| fab.is_routable(d, 0)),
+        "must converge before the kill"
+    );
     fab.kill_node(0); // the source dies
     for t in 1..=cap {
         fab.run_ticks(1);

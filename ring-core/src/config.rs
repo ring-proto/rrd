@@ -14,10 +14,10 @@ use std::time::Duration;
 /// wants alignment.) `tick` is the 100ms emission period; cadence-invariance rescales α with tick.
 #[derive(Clone, Copy, Debug)]
 pub struct Config {
-    pub d: f64,            // bulk conductance (default per-link g)
-    pub kappa: f64,        // baseline screening; reach λ = √(d/κ)
-    pub f0: f64,           // source self-pin potential
-    pub floor: f64,        // reachability floor on f
+    pub d: f64,               // bulk conductance (default per-link g)
+    pub kappa: f64,           // baseline screening; reach λ = √(d/κ)
+    pub f0: f64,              // source self-pin potential
+    pub floor: f64,           // reachability floor on f
     pub alpha: f64, // proper-time stale-evidence aging rate per tick (vitality + conductance, β=α); √(κ/D) aligns R_V=λ at φ=0.5
     pub phi: f64,   // vitality action threshold
     pub tick: Mono, // proper-time quantum AND emission period (coupled, per the design)
@@ -25,9 +25,9 @@ pub struct Config {
     pub glide: f64, // glide rate r of reg()
     pub no_retard: bool, // ablation: adopt vitality un-aged (demonstrates Thm 6.2)
     pub no_link_age: bool, // ablation: keep stale link conductance frozen (dead-relay pin)
-    pub max_dests: usize,  // hard cap on interned destinations (untrusted-intern DoS bound)
+    pub max_dests: usize, // hard cap on interned destinations (untrusted-intern DoS bound)
     pub max_neighbors: usize, // hard cap on neighbour-table entries (per-(iface,src) spoofing DoS bound)
-    pub gc_dwell: f64,     // ticks a non-origin slot must stay GC-eligible before reach-ball eviction
+    pub gc_dwell: f64, // ticks a non-origin slot must stay GC-eligible before reach-ball eviction
 }
 
 impl Default for Config {
@@ -98,7 +98,10 @@ mod tests {
         assert!((lambda - 10.0).abs() < 1e-12, "λ = √(D/κ) = 10");
         assert!((r_v - 10.0).abs() < 1e-12, "R_V = (1/φ−1)/α = 10");
         assert!((r_v - lambda).abs() < 1e-12, "R_V = λ (aligned)");
-        assert!((c.alpha - (c.kappa / c.d).sqrt()).abs() < 1e-12, "α = √(κ/D)");
+        assert!(
+            (c.alpha - (c.kappa / c.d).sqrt()).abs() < 1e-12,
+            "α = √(κ/D)"
+        );
     }
 
     #[test]

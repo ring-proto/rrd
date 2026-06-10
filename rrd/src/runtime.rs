@@ -20,9 +20,9 @@ use ring_core::{DesiredRoute, Engine, Mono, NeighborId, Prefix, RouterId};
 use std::collections::HashMap;
 use std::future::Future;
 use std::net::Ipv6Addr;
-use std::time::Instant;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::time::Instant;
 use tokio::sync::{mpsc, watch};
 use tokio::time;
 
@@ -742,7 +742,10 @@ mod tests {
             hears: vec![],
             delta: vec![Entry {
                 dest: RouterId("b".into()),
-                prefix: Prefix { addr: "fd00:2::".parse().unwrap(), len: 64 },
+                prefix: Prefix {
+                    addr: "fd00:2::".parse().unwrap(),
+                    len: 64,
+                },
                 pot: 1.0,
                 vit: 1.0,
             }],
@@ -752,27 +755,39 @@ mod tests {
         // Five distinct link-local sources on one iface: the first 3 are admitted, the rest
         // are refused at the cap and their datagrams dropped.
         for i in 1u16..=5 {
-            let src = SocketAddrV6::new(
-                format!("fe80::{i}").parse().unwrap(),
-                6699,
-                0,
-                1,
-            );
-            daemon.handle_inbound(Inbound { iface: 1, src, data: data.clone() });
+            let src = SocketAddrV6::new(format!("fe80::{i}").parse().unwrap(), 6699, 0, 1);
+            daemon.handle_inbound(Inbound {
+                iface: 1,
+                src,
+                data: data.clone(),
+            });
         }
 
         let snap = daemon.build_snapshot();
         assert_eq!(snap.metrics.neighbors, 3, "exactly max_neighbors admitted");
-        assert_eq!(snap.metrics.neighbors_rejected_total, 2, "two over-cap sources refused");
+        assert_eq!(
+            snap.metrics.neighbors_rejected_total, 2,
+            "two over-cap sources refused"
+        );
         // All five datagrams were received (counted), even the dropped ones.
         assert_eq!(snap.metrics.datagrams_rx_total, 5);
 
         // A previously-admitted source still resolves (steady state never rejects): re-feeding
         // it does not increment the rejection counter.
         let known = SocketAddrV6::new("fe80::1".parse().unwrap(), 6699, 0, 1);
-        daemon.handle_inbound(Inbound { iface: 1, src: known, data: data.clone() });
+        daemon.handle_inbound(Inbound {
+            iface: 1,
+            src: known,
+            data: data.clone(),
+        });
         let snap2 = daemon.build_snapshot();
-        assert_eq!(snap2.metrics.neighbors, 3, "no new neighbour from a known source");
-        assert_eq!(snap2.metrics.neighbors_rejected_total, 2, "known source is not a rejection");
+        assert_eq!(
+            snap2.metrics.neighbors, 3,
+            "no new neighbour from a known source"
+        );
+        assert_eq!(
+            snap2.metrics.neighbors_rejected_total, 2,
+            "known source is not a rejection"
+        );
     }
 }

@@ -28,8 +28,13 @@ mod tests {
     #[test]
     fn ticks_between_counts_and_saturates() {
         let tick = Duration::from_millis(100);
-        assert!((ticks_between(Duration::ZERO, Duration::from_millis(500), tick) - 5.0).abs() < 1e-9);
+        assert!(
+            (ticks_between(Duration::ZERO, Duration::from_millis(500), tick) - 5.0).abs() < 1e-9
+        );
         // now earlier than `earlier` saturates to 0, never panics
-        assert_eq!(ticks_between(Duration::from_millis(500), Duration::ZERO, tick), 0.0);
+        assert_eq!(
+            ticks_between(Duration::from_millis(500), Duration::ZERO, tick),
+            0.0
+        );
     }
 }

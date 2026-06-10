@@ -20,10 +20,18 @@ fn stressing_the_short_path_diverts_traffic() {
     let mut fab = Fabric::build_aligned(5, &links, cfg, 7);
     fab.run_ticks(400);
     let before = fab.route(0, 4).and_then(|r| r.via);
-    assert_eq!(before, Some(NeighborId(1)), "unstressed: S routes to D via short-path A");
+    assert_eq!(
+        before,
+        Some(NeighborId(1)),
+        "unstressed: S routes to D via short-path A"
+    );
 
     fab.set_stress(1, 50.0); // heavily load A
     fab.run_ticks(800);
     let after = fab.route(0, 4).and_then(|r| r.via);
-    assert_eq!(after, Some(NeighborId(2)), "stressed A: S diverts to long-path B1");
+    assert_eq!(
+        after,
+        Some(NeighborId(2)),
+        "stressed A: S diverts to long-path B1"
+    );
 }
