@@ -13,6 +13,10 @@ path = "src/lib.rs"
 name = "rrd"
 path = "src/main.rs"
 
+[[bin]]
+name = "rrdctl"
+path = "src/bin/rrdctl.rs"
+
 [dependencies]
 ring-core = { workspace = true }
 rrd-proto = { path = "../rrd-proto" }

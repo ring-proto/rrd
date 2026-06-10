@@ -1,5 +1,8 @@
 [package]
 name = "rrd-agent"
+# Only build explicitly-declared bins; the dormant src/bin/rrdctl.rs (parked with
+# CNI) must NOT be auto-discovered — the daemon-facing rrdctl lives in the rrd crate.
+autobins = false
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -12,10 +15,6 @@ path = "src/lib.rs"
 [[bin]]
 name = "rrd-agent"
 path = "src/bin/rrd-agent.rs"
-
-[[bin]]
-name = "rrdctl"
-path = "src/bin/rrdctl.rs"
 
 [dependencies]
 anyhow = { workspace = true }
