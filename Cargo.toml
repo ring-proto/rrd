@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["ring-core", "ring-sim", "rrd", "rrd-cni", "rrd-agent"]
+members = ["ring-core", "ring-sim", "rrd", "rrd-cni", "rrd-agent", "rrd-proto"]
 
 [workspace.package]
 version = "0.1.0"
